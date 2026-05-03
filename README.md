@@ -150,7 +150,10 @@ Pull emails, generate QR codes, shorten URLs, archive pages, look up Wikipedia, 
 | `google_search` | Web search with time filters, site filters, pagination, language/region |
 | `google_news` | News search with article thumbnails inline |
 | `google_scholar` | Academic papers with citations |
-| `google_images` | Image search with results displayed inline in chat |
+| `google_images` | Full-size (FHD/4K) image search with size filter, save-to-disk, anti-hotlink download, Bing fallback |
+| `download_image` | Download a single image URL with anti-hotlink Referer fallback |
+| `download_file` | Download any file (PDF/DOCX/ZIP/video) with anti-hotlink Referer fallback |
+| `download_files_from_page` | Visit a page and bulk-download all matching files (images/PDFs/videos) — `srcset` support, CSS selector, optional min image size |
 | `google_trends` | Topic interest over time, related queries |
 | `visit_page` | Fetch any URL and extract readable text |
 
@@ -442,16 +445,69 @@ Pull emails, generate QR codes, shorten URLs, archive pages, look up Wikipedia, 
 | `query` | Book search query (required) | `"machine learning"` |
 | `num_results` | Number of results (1-10, default 5) | `5` |
 
-#### `google_images` — Image Search (inline in chat)
+#### `google_images` — Image Search (full-size, FHD by default)
+
+Returns real source URLs (not Google thumbnails) by parsing Google's embedded JSON,
+with click-into-tile fallback. Filters by minimum dimensions, downloads with
+anti-hotlink Referer headers (Pinterest/Getty/Shutterstock-friendly), and falls
+back to **Bing Images** when Google rate-limits / shows CAPTCHA. Real pixel sizes
+are verified after download via OpenCV (or a built-in header parser).
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `query` | Image search query (required) | `"sunset over ocean"` |
-| `num_results` | Number of results (1-10, default 5) | `5` |
+| `num_results` | Number of results (1-20, default 5) | `10` |
+| `min_size` | One of `any`, `large`, `2mp`, `fhd`, `qhd`, `4mp`, `8mp`, `4k`. Default `fhd` (≥1920×1080) | `"4k"` |
+| `save_to` | Directory to save full-size files. If set, returns paths instead of inline images. `~` expanded | `"~/wallpapers"` |
+| `deep` | Click each tile to grab full URL from the detail panel (slower, more reliable) | `True` |
+| `fallback_bing` | Fall back to Bing Images on Google block (default `True`) | `False` |
+
+When `save_to` is provided, files are named `{query_slug}_{NN}_{WxH}.{ext}`.
 
 ![Google Image Search](images/google_image_search.png)
 
 ![Google Image Search](images/google_image_search2.png)
+
+#### `download_image` — Single-URL Download with Anti-Hotlink Referer
+
+Downloads a direct image URL, trying multiple Referer values (source domain →
+Google → none) to bypass CDN hotlink protection used by Pinterest, Getty,
+Shutterstock, and similar services.
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `url` | Direct image URL (required) | `"https://example.com/photo.jpg"` |
+| `save_to` | File path or directory. If a directory, filename is derived from URL. `~` expanded. If `None`, returns inline image | `"~/Pictures"` |
+| `referer` | Custom `Referer` header. If `None`, auto-tries source domain → Google → none | `"https://pinterest.com/"` |
+
+#### `download_file` — Generic File Download (PDF/DOCX/ZIP/video)
+
+Same anti-hotlink Referer chain as `download_image` but for arbitrary file
+types and always saves to disk.
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `url` | Direct file URL (required) | `"https://example.com/spec.pdf"` |
+| `save_to` | File path or directory. `~` expanded. `None` returns size info only | `"~/Documents"` |
+| `referer` | Custom `Referer` header. If `None`, auto-tries source domain → Google → none | `"https://www.example.com/"` |
+
+#### `download_files_from_page` — Bulk-Download from a Webpage
+
+Renders the page (with full anti-bot stealth), parses `<img>`, `<source>`,
+`<a href>`, `<video>`/`<audio>`, `og:image`/`twitter:image` meta tags and
+inline `background-image` styles, picks the highest-resolution variant from
+`srcset`, and bulk-downloads everything that matches the file-type filter.
+Optional CSS selector to scope the search; optional minimum image-size filter.
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `url` | Page URL to visit (required) | `"https://example.com/gallery"` |
+| `save_to` | Directory to save into (required, `~` expanded) | `"~/uni-photos"` |
+| `file_types` | Preset (`images`, `documents`, `videos`, `audio`, `archives`, `any`) or comma-separated extensions | `"jpg,png,pdf"` |
+| `css_selector` | If set, only collect links inside this selector | `".campus-gallery"` |
+| `min_kb` | Skip files smaller than this many KB (default 30) | `100` |
+| `max_files` | Stop after this many successful saves (default 50) | `30` |
+| `min_image_size` | When downloading images, also enforce min pixels (`fhd`/`4k`/...) | `"fhd"` |
 
 #### `google_trends` — Trends
 

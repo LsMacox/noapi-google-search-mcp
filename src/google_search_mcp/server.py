@@ -8,7 +8,10 @@ Tools provided:
     - google_search: Search with time filtering, site filtering, pagination, language/region
     - google_news: Search Google News for recent headlines
     - google_scholar: Search Google Scholar for academic papers
-    - google_images: Search Google Images for image URLs
+    - google_images: Search Google Images for full-size (FHD+) images with size filtering, save-to-disk, anti-hotlink download, and DuckDuckGo fallback
+    - download_image: Download a single image URL with anti-hotlink Referer fallback (Pinterest/Getty/Shutterstock-friendly)
+    - download_file: Download any file (PDF/DOCX/ZIP/video) with anti-hotlink Referer fallback
+    - download_files_from_page: Visit a page and bulk-download every matching file (images/PDFs/videos) with srcset support, optional CSS selector, min size filter
     - google_trends: Check Google Trends for topic interest over time
     - google_maps: Search Google Maps for places, restaurants, businesses
     - google_maps_directions: Get directions between locations with route map screenshot
@@ -58,61 +61,208 @@ from playwright.async_api import async_playwright
 
 mcp = FastMCP("google-search")
 
+import platform as _platform
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# JavaScript to inject before every page load to hide automation signals
+USER_AGENT_MAC = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+USER_AGENT_WIN = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _platform_user_agent() -> str:
+    """Pick a UA string matching the current OS so OS hints stay consistent."""
+    s = _platform.system().lower()
+    if s == "darwin":
+        return USER_AGENT_MAC
+    if s == "windows":
+        return USER_AGENT_WIN
+    return USER_AGENT
+
+
+# Persistent browser profile dir (cookies, history, localStorage). Google sees
+# repeated sessions as a returning user → much less likely to challenge.
+PROFILE_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "noapi-google-search-mcp", "profile"
+)
+
+# Strong stealth JS — extends the basic patches with WebGL/audio fingerprint
+# spoofing, chrome.app/csi/loadTimes, realistic hardware metrics, iframe leak
+# fix, Function.prototype.toString native check, and webdriver removal at the
+# prototype level. Patches ALL the surface area Google's bot-detection samples.
 STEALTH_JS = """
-// Overwrite navigator.webdriver to false
-Object.defineProperty(navigator, 'webdriver', { get: () => false });
+(() => {
+    // ---- navigator overrides ----
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true }); } catch(e){}
+    try { delete Navigator.prototype.webdriver; } catch(e){}
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true });
 
-// Fake plugins array (headless Chrome has none by default)
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [
-        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer',
-          description: 'Portable Document Format',
-          length: 1, item: () => null, namedItem: () => null,
-          [Symbol.iterator]: function*() { yield {type: 'application/pdf'}; } },
-        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
-          description: '', length: 1, item: () => null, namedItem: () => null,
-          [Symbol.iterator]: function*() { yield {type: 'application/pdf'}; } },
-        { name: 'Native Client', filename: 'internal-nacl-plugin',
-          description: '', length: 2, item: () => null, namedItem: () => null,
-          [Symbol.iterator]: function*() { yield {type: 'application/x-nacl'}; yield {type: 'application/x-pnacl'}; } },
-    ],
-});
+    // platform stays driven by UA, but make sure it's not "" (headless leak)
+    if (!navigator.platform || navigator.platform === '') {
+        try { Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel', configurable: true }); } catch(e){}
+    }
 
-// Fake languages
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    // network connection (real Chrome exposes this)
+    if (!navigator.connection) {
+        try {
+            Object.defineProperty(navigator, 'connection', {
+                get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null }),
+                configurable: true,
+            });
+        } catch(e){}
+    }
 
-// Fake chrome.runtime to look like a real Chrome browser
-if (!window.chrome) { window.chrome = {}; }
-if (!window.chrome.runtime) {
-    window.chrome.runtime = {
-        connect: function() {},
-        sendMessage: function() {},
-        onMessage: { addListener: function() {} },
+    // ---- plugins / mimeTypes (PDF Viewer is present on real Chrome) ----
+    const fakePlugin = (name, filename) => {
+        const p = { name, filename, description: 'Portable Document Format', length: 1 };
+        const m = { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: p };
+        p[0] = m;
+        p.item = i => p[i];
+        p.namedItem = n => (m.type === n ? m : null);
+        return p;
     };
-}
+    const pluginsArr = [
+        fakePlugin('PDF Viewer', 'internal-pdf-viewer'),
+        fakePlugin('Chrome PDF Viewer', 'internal-pdf-viewer'),
+        fakePlugin('Chromium PDF Viewer', 'internal-pdf-viewer'),
+        fakePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer'),
+        fakePlugin('WebKit built-in PDF', 'internal-pdf-viewer'),
+    ];
+    pluginsArr.item = i => pluginsArr[i];
+    pluginsArr.namedItem = n => pluginsArr.find(p => p.name === n) || null;
+    pluginsArr.refresh = () => {};
+    Object.defineProperty(navigator, 'plugins', { get: () => pluginsArr, configurable: true });
 
-// Remove Playwright-specific properties
-delete window.__playwright;
-delete window.__pw_manual;
+    // ---- window.chrome (full surface, not just .runtime) ----
+    window.chrome = window.chrome || {};
+    if (!window.chrome.runtime) {
+        window.chrome.runtime = {
+            PlatformOs:   { MAC:'mac', WIN:'win', ANDROID:'android', CROS:'cros', LINUX:'linux', OPENBSD:'openbsd' },
+            PlatformArch: { ARM:'arm', X86_32:'x86-32', X86_64:'x86-64' },
+            RequestUpdateCheckStatus: { THROTTLED:'throttled', NO_UPDATE:'no_update', UPDATE_AVAILABLE:'update_available' },
+            OnInstalledReason: { INSTALL:'install', UPDATE:'update', CHROME_UPDATE:'chrome_update', SHARED_MODULE_UPDATE:'shared_module_update' },
+            OnRestartRequiredReason: { APP_UPDATE:'app_update', OS_UPDATE:'os_update', PERIODIC:'periodic' },
+            connect: () => undefined,
+            sendMessage: () => undefined,
+            onMessage:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+            onConnect:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
+            id: undefined,
+        };
+    }
+    if (!window.chrome.app) {
+        window.chrome.app = {
+            isInstalled: false,
+            InstallState: { DISABLED:'disabled', INSTALLED:'installed', NOT_INSTALLED:'not_installed' },
+            RunningState: { CANNOT_RUN:'cannot_run', READY_TO_RUN:'ready_to_run', RUNNING:'running' },
+            getDetails: () => null,
+            getIsInstalled: () => false,
+        };
+    }
+    if (!window.chrome.csi) {
+        window.chrome.csi = function() {
+            return { onloadT: Date.now(), pageT: performance.now(), startE: Date.now() - 1000, tran: 15 };
+        };
+    }
+    if (!window.chrome.loadTimes) {
+        window.chrome.loadTimes = function() {
+            const t = Date.now() / 1000;
+            return {
+                requestTime: t - 1, startLoadTime: t - 1, commitLoadTime: t - 0.5,
+                finishDocumentLoadTime: t - 0.2, finishLoadTime: t,
+                firstPaintTime: t - 0.1, firstPaintAfterLoadTime: 0,
+                navigationType: 'Other', wasFetchedViaSpdy: true,
+                wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2',
+                wasAlternateProtocolAvailable: false, connectionInfo: 'h2',
+            };
+        };
+    }
 
-// Patch permissions query for notifications
-const originalQuery = window.Notification && Notification.permission
-    ? Notification.permission : 'default';
-if (navigator.permissions && navigator.permissions.query) {
-    const origQuery = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = (params) => {
-        if (params.name === 'notifications') {
-            return Promise.resolve({ state: originalQuery, onchange: null });
+    // ---- WebGL fingerprint spoof (UNMASKED_VENDOR / UNMASKED_RENDERER) ----
+    // Real Chrome on Mac reports e.g. "Apple Inc." / "Apple GPU".
+    // Headless Chromium reports "Google Inc." / "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620, ...)" or SwiftShader.
+    const _fakeGL = function(orig, p) {
+        if (p === 0x9245) return 'Apple Inc.';
+        if (p === 0x9246) return 'Apple M1';
+        return orig.call(this, p);
+    };
+    if (window.WebGLRenderingContext) {
+        const proto1 = WebGLRenderingContext.prototype;
+        const _gp1 = proto1.getParameter;
+        proto1.getParameter = function(p) { return _fakeGL.call(this, _gp1, p); };
+    }
+    if (window.WebGL2RenderingContext) {
+        const proto2 = WebGL2RenderingContext.prototype;
+        const _gp2 = proto2.getParameter;
+        proto2.getParameter = function(p) { return _fakeGL.call(this, _gp2, p); };
+    }
+
+    // ---- Permissions: notifications must be 'default' not 'denied' (headless leak) ----
+    if (navigator.permissions && navigator.permissions.query) {
+        const _origQ = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = (params) => {
+            if (params && params.name === 'notifications') {
+                return Promise.resolve({ state: 'default', onchange: null });
+            }
+            return _origQ(params);
+        };
+    }
+
+    // ---- iframe contentWindow leak fix (some scripts probe this) ----
+    try {
+        const _cw = HTMLIFrameElement.prototype.__lookupGetter__('contentWindow');
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() { return _cw.call(this) || window; },
+            configurable: true,
+        });
+    } catch(e) {}
+
+    // ---- Function.prototype.toString — keep "[native code]" for our patched fns ----
+    const _origToString = Function.prototype.toString;
+    Function.prototype.toString = new Proxy(_origToString, {
+        apply: function(target, thisArg, args) {
+            try {
+                const name = thisArg && thisArg.name ? thisArg.name : '';
+                // Heuristic: if our shimmed methods were touched, claim native
+                if (name === 'getParameter' || name === 'query' || name === 'sendMessage') {
+                    return 'function ' + name + '() { [native code] }';
+                }
+            } catch(e) {}
+            return target.apply(thisArg, args);
+        },
+    });
+
+    // ---- remove playwright/cdc/automation traces ----
+    try { delete window.__playwright; } catch(e) {}
+    try { delete window.__pw_manual; } catch(e) {}
+    try { delete window.__PW_inspect; } catch(e) {}
+    Object.keys(window).forEach(k => {
+        if (k.startsWith('cdc_')) { try { delete window[k]; } catch(e) {} }
+    });
+
+    // ---- screen consistency (headless sometimes reports 0x0) ----
+    try {
+        if (!screen.width || !screen.height) {
+            Object.defineProperty(screen, 'width', { get: () => 1366, configurable: true });
+            Object.defineProperty(screen, 'height', { get: () => 768, configurable: true });
+            Object.defineProperty(screen, 'availWidth', { get: () => 1366, configurable: true });
+            Object.defineProperty(screen, 'availHeight', { get: () => 768, configurable: true });
+            Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
+            Object.defineProperty(screen, 'pixelDepth', { get: () => 24, configurable: true });
         }
-        return origQuery(params);
-    };
-}
+    } catch(e){}
+})();
 """
 
 # Google's time filter parameter values
@@ -123,6 +273,35 @@ TIME_RANGE_MAP = {
     "past_month": "qdr:m",
     "past_year": "qdr:y",
 }
+
+
+_STEALTH_CHROME_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process,AutomationControlled",
+    "--disable-dev-shm-usage",
+    "--disable-infobars",
+    "--no-default-browser-check",
+    "--no-first-run",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-background-networking",
+    "--disable-breakpad",
+    "--disable-client-side-phishing-detection",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-domain-reliability",
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
+    "--disable-hang-monitor",
+    "--disable-ipc-flooding-protection",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--no-pings",
+    "--window-size=1366,820",
+]
 
 
 async def _launch_browser(pw, viewport=None):
@@ -139,13 +318,108 @@ async def _launch_browser(pw, viewport=None):
     )
     vp = viewport or {"width": 1280, "height": 800}
     context = await browser.new_context(
-        user_agent=USER_AGENT,
+        user_agent=_platform_user_agent(),
         viewport=vp,
         locale="en-US",
     )
     # Inject stealth patches before any page loads
     await context.add_init_script(STEALTH_JS)
     return browser, context
+
+
+def _system_timezone_id() -> str | None:
+    """Detect the OS timezone ID (e.g. ``Europe/Moscow``) for Playwright."""
+    # POSIX: /etc/localtime symlink usually points at the IANA file
+    try:
+        path = os.path.realpath("/etc/localtime")
+        if "zoneinfo/" in path:
+            return path.split("zoneinfo/", 1)[1]
+    except Exception:
+        pass
+    # macOS: /var/db/timezone/zoneinfo/<TZ> or use `systemsetup -gettimezone`
+    try:
+        if sys.platform == "darwin":
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["systemsetup", "-gettimezone"], text=True, timeout=2
+            ).strip()
+            if "Time Zone:" in out:
+                return out.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    # env fallback
+    return os.environ.get("TZ") or None
+
+
+async def _launch_stealth_browser(pw, headless: bool = True):
+    """Launch a hardened browser tuned to slip past Google's bot detection.
+
+    Uses a persistent profile (cookies/history accumulate so Google sees a
+    returning user) and prefers the real installed Google Chrome over the
+    bundled Chromium — TLS/JA3 fingerprint, sub-resource integrity, version
+    strings and User-Agent Client Hints all match the real browser.
+
+    Returns ``(None, context)`` because persistent contexts have no separate
+    browser handle — close ``context`` to shut everything down.
+    """
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    ua = _platform_user_agent()
+    base_kwargs = dict(
+        user_data_dir=PROFILE_DIR,
+        headless=headless,
+        args=list(_STEALTH_CHROME_ARGS),
+        user_agent=ua,
+        viewport={"width": 1366, "height": 820},
+        locale="en-US",
+        color_scheme="light",
+        ignore_https_errors=True,
+        bypass_csp=True,
+    )
+    tz = _system_timezone_id()
+    if tz:
+        base_kwargs["timezone_id"] = tz
+    last_err: Exception | None = None
+    # Try real Chrome first (channel="chrome"), then bundled Chromium
+    for channel in ("chrome", None):
+        try:
+            kwargs = dict(base_kwargs)
+            if channel:
+                kwargs["channel"] = channel
+            ctx = await pw.chromium.launch_persistent_context(**kwargs)
+            await ctx.add_init_script(STEALTH_JS)
+            return None, ctx
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Could not launch stealth browser: {last_err}")
+
+
+async def _human_warmup(page):
+    """Visit google.com first, jiggle the mouse, scroll a bit — looks human-ish."""
+    try:
+        await page.goto(
+            "https://www.google.com/?hl=en",
+            wait_until="domcontentloaded",
+            timeout=20000,
+        )
+    except Exception:
+        return
+    try:
+        await _dismiss_consent(page)
+    except Exception:
+        pass
+    try:
+        for _ in range(random.randint(3, 5)):
+            x = random.randint(120, 1240)
+            y = random.randint(120, 700)
+            await page.mouse.move(x, y, steps=random.randint(8, 18))
+            await page.wait_for_timeout(random.randint(120, 380))
+        await page.evaluate(
+            "window.scrollBy(0, %d)" % random.randint(120, 380)
+        )
+        await page.wait_for_timeout(random.randint(400, 900))
+    except Exception:
+        pass
 
 
 COOKIE_PATH = os.path.join(os.path.expanduser("~"), ".google_mcp_cookies.json")
@@ -943,120 +1217,635 @@ async def google_scholar(query: str, num_results: int = 5) -> str:
 # google_images
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def google_images(query: str, num_results: int = 5) -> list:
-    """Search Google Images and return images inline in chat.
+# tbs (image size) parameter values for Google Images URL
+_GOOGLE_IMG_SIZE_TBS = {
+    "any":   "",
+    "large": "isz:l",
+    "2mp":   "isz:lt,islt:2mp",
+    "4mp":   "isz:lt,islt:4mp",
+    "8mp":   "isz:lt,islt:8mp",
+    "fhd":   "isz:lt,islt:2mp",
+    "qhd":   "isz:lt,islt:4mp",
+    "4k":    "isz:lt,islt:8mp",
+}
 
-    Returns image thumbnails directly in the conversation so you can see them.
-    Also provides source URLs for each image.
+# Post-filter minimum (long_side, short_side) in px per preset
+_MIN_DIMS = {
+    "any":   (0, 0),
+    "large": (800, 600),
+    "2mp":   (1600, 1200),
+    "4mp":   (2200, 1700),
+    "8mp":   (3200, 2400),
+    "fhd":   (1920, 1080),
+    "qhd":   (2560, 1440),
+    "4k":    (3840, 2160),
+}
+
+# Hosts that serve only thumbnails — exclude when extracting full URLs
+_THUMB_HOST_RE = re.compile(r"(encrypted-tbn|gstatic\.com|googleusercontent\.com/[a-z]/)", re.I)
+
+
+def _slugify(text: str, maxlen: int = 60) -> str:
+    """Filesystem-safe slug from arbitrary text (Unicode-friendly)."""
+    s = re.sub(r"[\s/\\:*?\"<>|]+", "_", text.strip())
+    s = re.sub(r"_+", "_", s).strip("_.")
+    return (s[:maxlen] or "image")
+
+
+def _ext_from_content_type(ct: str, fallback: str = "jpg") -> str:
+    ct = (ct or "").split(";")[0].strip().lower()
+    return {
+        "image/jpeg": "jpg", "image/jpg": "jpg",
+        "image/png": "png", "image/webp": "webp",
+        "image/gif": "gif", "image/bmp": "bmp",
+        "image/tiff": "tiff", "image/svg+xml": "svg",
+    }.get(ct, fallback)
+
+
+def _parse_google_images_json(html: str) -> list[dict]:
+    """Extract {url, a, b} triples from Google Images embedded JSON.
+
+    Google encodes images as ["https://...ext", H, W] inside script tags.
+    We don't assume H/W ordering — caller filters by min(a,b) and max(a,b).
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+    pattern = re.compile(
+        r'\["(https?://[^"\\]+?\.(?:jpe?g|png|webp|gif))",\s*(\d{2,5}),\s*(\d{2,5})\s*\]',
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(html):
+        url = m.group(1)
+        if _THUMB_HOST_RE.search(url):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        a, b = int(m.group(2)), int(m.group(3))
+        found.append({"url": url, "a": a, "b": b})
+    return found
+
+
+async def _download_image_bytes(
+    context, url: str, referers: list, timeout_ms: int = 12000
+) -> tuple[bytes, str] | None:
+    """Try downloading an image with each referer in order, return (bytes, content_type)."""
+    for ref in referers:
+        try:
+            headers = {
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            }
+            if ref:
+                headers["Referer"] = ref
+            resp = await context.request.get(url, headers=headers, timeout=timeout_ms)
+            if resp.ok:
+                body = await resp.body()
+                ct = resp.headers.get("content-type", "image/jpeg")
+                if len(body) >= 1024 and ct.lower().startswith("image/"):
+                    return body, ct
+        except Exception:
+            continue
+    return None
+
+
+async def _click_image_tiles_for_full_urls(page, n: int) -> list[dict]:
+    """Click image tiles to open the side panel and grab the high-res URL."""
+    out: list[dict] = []
+    if n <= 0:
+        return out
+    try:
+        tiles = await page.locator(
+            'div[data-id] a[href^="/imgres"], a[jsname][href*="/imgres"]'
+        ).all()
+    except Exception:
+        tiles = []
+    for tile in tiles[: max(n * 3, 8)]:
+        try:
+            await tile.scroll_into_view_if_needed(timeout=3000)
+            await tile.click(timeout=3000)
+            await page.wait_for_timeout(random.randint(800, 1500))
+            big = await page.evaluate(
+                """
+                () => {
+                    const sel = 'img[jsname], img[class*="sFlh5c"], img[class*="iPVvYb"], a img[src^="http"]';
+                    const imgs = document.querySelectorAll(sel);
+                    for (const img of imgs) {
+                        const src = img.src || '';
+                        if (!src.startsWith('http')) continue;
+                        if (src.includes('encrypted-tbn') || src.includes('gstatic.com')) continue;
+                        const w = img.naturalWidth || img.width || 0;
+                        const h = img.naturalHeight || img.height || 0;
+                        if (w < 400 && h < 400) continue;
+                        return {url: src, w: w, h: h, alt: img.alt || ''};
+                    }
+                    return null;
+                }
+                """
+            )
+            if big and big.get("url"):
+                out.append({
+                    "url": big["url"],
+                    "title": big.get("alt") or "",
+                    "width": int(big.get("w") or 0),
+                    "height": int(big.get("h") or 0),
+                })
+            if len(out) >= n:
+                break
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await page.wait_for_timeout(random.randint(300, 700))
+        except Exception:
+            continue
+    return out
+
+
+def _measure_image_dims_header(body: bytes) -> tuple[int, int] | None:
+    """Parse width/height from image file headers (JPEG/PNG/WebP/GIF/BMP).
+
+    Zero-dependency fallback for when OpenCV is unavailable. Returns None on
+    unsupported / corrupt input.
+    """
+    if not body or len(body) < 16:
+        return None
+    # PNG: 8-byte signature + IHDR chunk at offset 16: width(4) height(4) BE
+    if body[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            w = int.from_bytes(body[16:20], "big")
+            h = int.from_bytes(body[20:24], "big")
+            if w and h:
+                return w, h
+        except Exception:
+            return None
+    # GIF: "GIF87a"/"GIF89a" + LE width(2) height(2) at offset 6
+    if body[:6] in (b"GIF87a", b"GIF89a"):
+        try:
+            w = int.from_bytes(body[6:8], "little")
+            h = int.from_bytes(body[8:10], "little")
+            if w and h:
+                return w, h
+        except Exception:
+            return None
+    # BMP: "BM" header, width@18 (LE int32), height@22 (LE int32, may be negative)
+    if body[:2] == b"BM":
+        try:
+            w = int.from_bytes(body[18:22], "little", signed=True)
+            h = int.from_bytes(body[22:26], "little", signed=True)
+            if w and h:
+                return abs(w), abs(h)
+        except Exception:
+            return None
+    # WebP: "RIFF....WEBP" then chunk type ("VP8 "/"VP8L"/"VP8X")
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        try:
+            chunk = body[12:16]
+            if chunk == b"VP8X":
+                # offset 24: 3 bytes width-1 LE, 3 bytes height-1 LE
+                w = int.from_bytes(body[24:27], "little") + 1
+                h = int.from_bytes(body[27:30], "little") + 1
+                return w, h
+            if chunk == b"VP8 ":
+                # frame tag + start codes; size at offset 26
+                w = int.from_bytes(body[26:28], "little") & 0x3FFF
+                h = int.from_bytes(body[28:30], "little") & 0x3FFF
+                if w and h:
+                    return w, h
+            if chunk == b"VP8L":
+                # at offset 21: 14 bits width-1, 14 bits height-1, packed LE
+                b0, b1, b2, b3 = body[21], body[22], body[23], body[24]
+                w = ((b1 & 0x3F) << 8 | b0) + 1
+                h = (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6)) + 1
+                return w, h
+        except Exception:
+            return None
+    # JPEG: scan SOFn markers
+    if body[:2] == b"\xff\xd8":
+        try:
+            i, n = 2, len(body)
+            while i + 9 < n:
+                if body[i] != 0xFF:
+                    i += 1
+                    continue
+                # skip padding 0xFF
+                while i < n and body[i] == 0xFF:
+                    i += 1
+                if i >= n:
+                    break
+                marker = body[i]
+                i += 1
+                if marker == 0xD8 or marker == 0xD9:
+                    continue
+                if marker == 0xDA:  # SOS — image data, stop
+                    break
+                if i + 1 >= n:
+                    break
+                seg_len = int.from_bytes(body[i:i+2], "big")
+                # SOFn (Start Of Frame): C0..CF except C4, C8, CC
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    # data: precision(1) height(2) width(2)
+                    h = int.from_bytes(body[i+3:i+5], "big")
+                    w = int.from_bytes(body[i+5:i+7], "big")
+                    if w and h:
+                        return w, h
+                i += seg_len
+        except Exception:
+            return None
+    return None
+
+
+def _measure_image_dims(body: bytes) -> tuple[int, int] | None:
+    """Return (width, height) of image bytes. Tries OpenCV → header parser."""
+    # Try OpenCV (more lenient with weird formats)
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+        arr = np.frombuffer(body, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            h, w = img.shape[:2]
+            return int(w), int(h)
+    except Exception:
+        pass
+    # Header-only fallback (no deps)
+    return _measure_image_dims_header(body)
+
+
+# Map our preset → Bing imagesize qft filter
+_BING_SIZE_QFT = {
+    "any":   "",
+    "large": "+filterui:imagesize-large",
+    "2mp":   "+filterui:imagesize-wallpaper",
+    "fhd":   "+filterui:imagesize-wallpaper",
+    "4mp":   "+filterui:imagesize-wallpaper",
+    "qhd":   "+filterui:imagesize-wallpaper",
+    "8mp":   "+filterui:imagesize-wallpaper",
+    "4k":    "+filterui:imagesize-wallpaper",
+}
+
+
+async def _bing_image_search(
+    context, query: str, num: int, min_size_key: str
+) -> list[dict]:
+    """Fallback: scrape Bing Images. Returns dicts with url/title/source.
+
+    Bing embeds full-size URL in m="<json>" attribute on each tile, no API
+    token required. We over-fetch (num*4) so the caller can post-filter by
+    measured dimensions.
+    """
+    encoded = quote_plus(query)
+    qft = _BING_SIZE_QFT.get(min_size_key, "")
+    url = f"https://www.bing.com/images/search?q={encoded}&first=1&qft={qft}&form=IRFLTR"
+    page = await context.new_page()
+    html = ""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(random.randint(1200, 2200))
+        # Trigger lazy-loading with a couple scrolls
+        for _ in range(2):
+            try:
+                await page.evaluate("window.scrollBy(0, 1500)")
+            except Exception:
+                break
+            await page.wait_for_timeout(random.randint(500, 900))
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
+    except Exception:
+        pass
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    if not html:
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    target = max(num * 4, num + 5)
+    for m in re.finditer(r'class="iusc"[^>]*\sm="([^"]+)"', html):
+        raw = m.group(1).replace("&quot;", '"').replace("&amp;", "&").replace("&#39;", "'")
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        murl = (d.get("murl") or "").strip()
+        if not murl or not murl.startswith("http"):
+            continue
+        if murl in seen:
+            continue
+        seen.add(murl)
+        out.append({
+            "url": murl,
+            "title": d.get("t") or "",
+            "source": d.get("purl") or "",
+            "width": 0,
+            "height": 0,
+        })
+        if len(out) >= target:
+            break
+    return out
+
+
+@mcp.tool()
+async def google_images(
+    query: str,
+    num_results: int = 5,
+    min_size: str = "fhd",
+    save_to: str | None = None,
+    deep: bool = False,
+    fallback_bing: bool = True,
+) -> list:
+    """Search Google Images and return full-size image URLs (FHD by default).
+
+    Bypasses Google's thumbnail-only listing by parsing the embedded JSON for
+    real source URLs, with optional click-into-tile fallback. Filters by
+    minimum dimensions, downloads with anti-hotlink Referer headers, and falls
+    back to Bing Images when Google rate-limits / blocks. Real pixel sizes are
+    measured via OpenCV after download to enforce the size filter accurately.
 
     Sample prompts that trigger this tool:
-        - "Show me images of the Northern Lights"
-        - "Find pictures of modern kitchen designs"
-        - "Search for diagrams of neural network architecture"
-        - "Show me what a DGX Spark looks like"
+        - "Show me FHD images of the Northern Lights"
+        - "Find 4K wallpapers of mountains"
+        - "Download 10 photos of modern kitchens to ~/kitchens"
+        - "Get high-res pictures of DGX Spark"
 
     Args:
-        query: The image search query string.
-        num_results: Number of image results to return (default 5, max 10).
+        query: Image search query.
+        num_results: 1-20 results (default 5).
+        min_size: One of "any", "large", "2mp", "fhd", "qhd", "4mp", "8mp", "4k".
+            Default "fhd" enforces ≥1920×1080 (or rotated equivalent).
+        save_to: Directory to save full-size images. If set, returns file paths
+            instead of inline images. ~ is expanded.
+        deep: Click each tile to extract full URL from the detail panel.
+            Slower but more reliable when JSON parsing yields too few results.
+        fallback_bing: Fall back to Bing Images on Google block (default True).
     """
-    import base64 as b64mod
-
-    num_results = max(1, min(num_results, 10))
+    num_results = max(1, min(num_results, 20))
+    min_size_key = (min_size or "fhd").lower()
+    if min_size_key not in _GOOGLE_IMG_SIZE_TBS:
+        min_size_key = "fhd"
+    long_min, short_min = _MIN_DIMS[min_size_key]
     encoded_query = quote_plus(query)
-    url = f"https://www.google.com/search?q={encoded_query}&hl=en&tbm=isch"
+    tbs = _GOOGLE_IMG_SIZE_TBS[min_size_key]
+    url = f"https://www.google.com/search?q={encoded_query}&hl=en&tbm=isch&safe=off"
+    if tbs:
+        url += f"&tbs={tbs}"
+
+    save_dir = None
+    if save_to:
+        save_dir = Path(os.path.expanduser(save_to))
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict] = []
+    blocked = False
+    fallback_used = False
+    block_path = ""
+
+    async def _scrape_once(context, warmup: bool = False) -> tuple[list[dict], bool, str]:
+        """Run one Google Images attempt against an open context. Returns
+        (results, blocked, sorry_url)."""
+        local: list[dict] = []
+        local_blocked = False
+        local_sorry = ""
+        page = await context.new_page()
+        try:
+            if warmup:
+                # hit google.com first so we don't navigate cold to /search?tbm=isch
+                await _human_warmup(page)
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            await _dismiss_consent(page)
+            await page.wait_for_timeout(random.randint(1500, 2800))
+
+            if await _is_blocked(page):
+                local_sorry = page.url
+                solved = await _try_solve_captcha(page)
+                if not solved:
+                    local_blocked = True
+                    return local, local_blocked, local_sorry
+
+            # Lazy-load more results via scroll + slight mouse movement
+            for _ in range(3):
+                try:
+                    await page.mouse.move(
+                        random.randint(200, 1100),
+                        random.randint(200, 700),
+                        steps=random.randint(5, 12),
+                    )
+                    await page.evaluate("window.scrollBy(0, 1800)")
+                except Exception:
+                    break
+                await page.wait_for_timeout(random.randint(700, 1300))
+
+            try:
+                html = await page.content()
+            except Exception:
+                html = ""
+
+            json_results = _parse_google_images_json(html)
+            for r in json_results:
+                a, b = r["a"], r["b"]
+                if min_size_key != "any":
+                    if max(a, b) < long_min or min(a, b) < short_min:
+                        continue
+                local.append({
+                    "title": "",
+                    "url": r["url"],
+                    "width": max(a, b),
+                    "height": min(a, b),
+                })
+                if len(local) >= num_results:
+                    break
+
+            if (deep or len(local) < num_results) and len(local) < num_results:
+                needed = num_results - len(local)
+                extra = await _click_image_tiles_for_full_urls(page, needed * 2)
+                for r in extra:
+                    if any(x["url"] == r["url"] for x in local):
+                        continue
+                    if min_size_key != "any":
+                        mw, mh = r.get("width", 0), r.get("height", 0)
+                        if mw and mh and (max(mw, mh) < long_min or min(mw, mh) < short_min):
+                            continue
+                    local.append(r)
+                    if len(local) >= num_results:
+                        break
+            return local, local_blocked, local_sorry
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     async with async_playwright() as pw:
-        browser, context = await _launch_browser(pw)
-        page = await context.new_page()
+        # Pass 1: lightweight bundled Chromium with cookie jar — cheapest, and
+        # empirically Google sometimes lets this through where a heavier
+        # fingerprint fails.
+        ctx_light = None
+        light_browser = None
+        try:
+            light_browser, ctx_light = await _launch_browser(pw)
+            await _load_cookies(ctx_light)
+            results, blocked, block_path = await _scrape_once(ctx_light, warmup=False)
+            if results:
+                await _save_cookies(ctx_light)
+        except Exception:
+            pass
+
+        # Pass 2: full stealth (persistent Chrome profile + warmup) when
+        # Pass 1 was challenged or returned nothing.
+        ctx_persistent = None
+        if blocked or not results:
+            try:
+                _, ctx_persistent = await _launch_stealth_browser(pw)
+                more, more_blocked, more_sorry = await _scrape_once(
+                    ctx_persistent, warmup=True
+                )
+                if more:
+                    seen = {r["url"] for r in results}
+                    for r in more:
+                        if r["url"] not in seen:
+                            results.append(r)
+                if not more_blocked:
+                    blocked = False
+                else:
+                    block_path = block_path or more_sorry
+            except Exception:
+                pass
+
+        # Pick a context for downloads / Bing fallback — persistent has the
+        # most cookies, otherwise reuse the light one.
+        context = ctx_persistent or ctx_light
+        download_browser = None
+        if context is None:
+            try:
+                download_browser, context = await _launch_browser(pw)
+            except Exception:
+                context = None
 
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await _dismiss_consent(page)
-            await page.wait_for_timeout(2000)
+            if context is None:
+                return f"Image search failed: could not start a browser context."
 
-            results = await page.evaluate(
-                """
-                (numResults) => {
-                    const results = [];
+            # Bing fallback when Google blocked or returned too few
+            candidates: list[dict] = list(results)
+            if (blocked or len(candidates) < num_results) and fallback_bing:
+                bing = await _bing_image_search(
+                    context, query, num_results, min_size_key
+                )
+                if bing:
+                    fallback_used = True
+                for r in bing:
+                    if any(x["url"] == r["url"] for x in candidates):
+                        continue
+                    candidates.append(r)
 
-                    const imgLinks = document.querySelectorAll('div[data-id] a[href^="/imgres"], a[jsname]');
-                    for (const a of imgLinks) {
-                        if (results.length >= numResults) break;
+            if not candidates:
+                return (
+                    f"No image results found for: {query} "
+                    f"(min_size={min_size_key}, blocked={blocked})"
+                )
 
-                        const img = a.querySelector('img[src^="http"], img[data-src^="http"]');
-                        if (!img) continue;
+            # Download with anti-hotlink Referer chain + measure real dims;
+            # keep only those that pass min_size after measurement.
+            slug = _slugify(query)
+            saved_paths: list[str] = []
+            kept: list[dict] = []
+            tried = 0
+            for r in candidates:
+                if len(kept) >= num_results:
+                    break
+                tried += 1
+                if tried > num_results * 6:
+                    break  # safety stop on hopeless candidate pools
+                img_url = r["url"]
+                try:
+                    domain_ref = "/".join(img_url.split("/", 3)[:3]) + "/"
+                except Exception:
+                    domain_ref = None
+                src_ref = r.get("source") or None
+                referers = [src_ref, domain_ref, "https://www.google.com/", None]
+                got = await _download_image_bytes(context, img_url, referers)
+                if not got:
+                    continue
+                body, ct = got
+                # Verify real pixel size
+                dims = _measure_image_dims(body)
+                if dims:
+                    rw, rh = dims
+                    if min_size_key != "any" and (
+                        max(rw, rh) < long_min or min(rw, rh) < short_min
+                    ):
+                        continue  # too small, skip
+                    r["width"], r["height"] = rw, rh
+                else:
+                    # Could not decode — fall back to claimed dims and accept
+                    rw, rh = r.get("width", 0), r.get("height", 0)
 
-                        const thumbnail = img.src || img.dataset.src || '';
-                        if (!thumbnail || thumbnail.startsWith('data:')) continue;
+                ext = _ext_from_content_type(ct, fallback="jpg")
+                idx = len(kept) + 1
+                if save_dir:
+                    dim_tag = f"_{rw}x{rh}" if (rw and rh) else ""
+                    fname = f"{slug}_{idx:02d}{dim_tag}.{ext}"
+                    path = save_dir / fname
+                    path.write_bytes(body)
+                    saved_paths.append(str(path))
+                    r["saved_path"] = str(path)
+                    r["bytes"] = len(body)
+                else:
+                    if len(body) > 8_000_000:
+                        r["error"] = f"too large to inline ({len(body)//1024}KB)"
+                        # still count it (URL is useful)
+                    else:
+                        r["image_bytes"] = body
+                        r["content_type"] = ct.split(";")[0].strip()
+                kept.append(r)
 
-                        let fullUrl = '';
-                        try {
-                            const href = a.href || '';
-                            const params = new URLSearchParams(href.split('?')[1] || '');
-                            fullUrl = params.get('imgurl') || '';
-                        } catch(e) {}
-
-                        results.push({
-                            title: img.alt || '',
-                            thumbnail: thumbnail,
-                            url: fullUrl || thumbnail,
-                        });
-                    }
-
-                    if (results.length === 0) {
-                        const allImgs = document.querySelectorAll('#search img[src^="http"], #islrg img[src^="http"]');
-                        for (const img of allImgs) {
-                            if (results.length >= numResults) break;
-                            if (img.width < 50 || img.height < 50) continue;
-                            results.push({
-                                title: img.alt || '',
-                                thumbnail: img.src,
-                                url: img.src,
-                            });
-                        }
-                    }
-
-                    return results;
-                }
-                """,
-                num_results,
-            )
+            results = kept
 
             if not results:
-                return f"No image results found for: {query}"
+                return (
+                    f"No image results passed min_size={min_size_key} for: {query} "
+                    f"(tried {tried} candidates, blocked={blocked})"
+                )
 
-            # Download full-size images for inline display (fall back to thumbnail)
-            for r in results[:num_results]:
-                full_url = r.get("url", "")
-                thumb_url = r.get("thumbnail", "")
-                for img_url in [full_url, thumb_url]:
-                    if not img_url or not img_url.startswith("http"):
-                        continue
-                    try:
-                        resp = await context.request.get(img_url, timeout=8000)
-                        if resp.ok:
-                            body = await resp.body()
-                            # Skip if too small (likely broken) or too large (>5MB)
-                            if len(body) < 1000 or len(body) > 5_000_000:
-                                continue
-                            r["image_bytes"] = body
-                            ct = resp.headers.get("content-type", "image/jpeg")
-                            r["content_type"] = ct.split(";")[0].strip()
-                            break
-                    except Exception:
-                        continue
+            # Build response
+            content: list = []
+            header = (
+                f"Image results for: {query} "
+                f"(min_size={min_size_key}, found={len(results)})"
+            )
+            if blocked and fallback_used:
+                header += " — Google blocked (/sorry/), used Bing fallback"
+            elif blocked:
+                header += " — Google blocked (/sorry/), no fallback results"
+            elif fallback_used:
+                header += " — supplemented with Bing"
+            content.append(header + "\n")
 
-            # Build mixed content: text descriptions + inline images
-            content = [f"Google Image Results for: {query}\n"]
-
-            for i, r in enumerate(results[:num_results], 1):
-                desc = f"{i}. {r.get('title', 'Untitled')}"
-                if r.get("url"):
-                    desc += f"\n   Source: {r['url']}"
+            for i, r in enumerate(results, 1):
+                title = r.get("title") or "image"
+                desc = f"{i}. {title}"
+                w, h = r.get("width", 0), r.get("height", 0)
+                if w and h:
+                    desc += f" [{w}x{h}]"
+                desc += f"\n   URL: {r['url']}"
+                if r.get("source"):
+                    desc += f"\n   Source: {r['source']}"
+                if r.get("saved_path"):
+                    desc += f"\n   Saved: {r['saved_path']} ({r.get('bytes', 0):,} bytes)"
+                if r.get("error"):
+                    desc += f"\n   Error: {r['error']}"
                 content.append(desc)
 
-                if r.get("image_bytes"):
+                if not save_dir and r.get("image_bytes"):
                     try:
                         ct = r.get("content_type", "image/jpeg")
                         fmt_map = {
@@ -1068,11 +1857,505 @@ async def google_images(query: str, num_results: int = 5) -> list:
                     except Exception:
                         pass
 
+            if save_dir:
+                content.append(
+                    f"\nSaved {len(saved_paths)} of {len(results)} images to {save_dir}"
+                )
+
             return content
 
         except Exception as e:
             return f"Image search failed: {e}"
 
+        finally:
+            for closeable in (ctx_persistent, light_browser, download_browser):
+                if closeable is None:
+                    continue
+                try:
+                    await closeable.close()
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# download_image
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def download_image(
+    url: str,
+    save_to: str | None = None,
+    referer: str | None = None,
+) -> list:
+    """Download a single image with anti-hotlink Referer fallback.
+
+    Many CDNs (Pinterest, Getty, Shutterstock, etc.) return 403 for direct
+    image requests without a matching Referer. This tool tries the source
+    domain, then Google, then no-Referer to maximize success.
+
+    Sample prompts that trigger this tool:
+        - "Download https://example.com/photo.jpg to ~/Pictures"
+        - "Save this image: <url>"
+        - "Fetch the full-size version of this image and store it"
+
+    Args:
+        url: Direct URL to the image (jpg/png/webp/gif).
+        save_to: File path or directory to save into. If a directory or path
+            ending with "/", filename is derived from URL. ~ is expanded.
+            If None, returns the image inline in chat.
+        referer: Custom Referer header. If None, auto-tries source domain →
+            Google → none.
+    """
+    if not url or not url.startswith("http"):
+        return [f"Invalid URL: {url!r}"]
+
+    if referer:
+        referers: list = [referer]
+    else:
+        try:
+            domain_ref = "/".join(url.split("/", 3)[:3]) + "/"
+        except Exception:
+            domain_ref = None
+        referers = [domain_ref, "https://www.google.com/", None]
+
+    async with async_playwright() as pw:
+        browser, context = await _launch_browser(pw)
+        try:
+            got = await _download_image_bytes(
+                context, url, referers, timeout_ms=20000
+            )
+            if not got:
+                tried = [r for r in referers if r]
+                return [f"Download failed for {url} (tried referers: {tried})"]
+            body, ct = got
+            ext = _ext_from_content_type(ct, fallback="jpg")
+
+            if save_to:
+                target = Path(os.path.expanduser(save_to))
+                if save_to.endswith(("/", os.sep)) or target.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    raw = url.rstrip("/").split("/")[-1].split("?")[0] or f"image.{ext}"
+                    if "." not in raw:
+                        raw = f"{raw}.{ext}"
+                    target = target / raw
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+                return [
+                    f"Saved {len(body):,} bytes ({ct}) to {target}"
+                ]
+
+            if len(body) > 15_000_000:
+                return [
+                    f"Downloaded {len(body):,} bytes ({ct}) from {url} — "
+                    f"too large to inline; pass save_to= to write to disk."
+                ]
+            fmt_map = {
+                "image/jpeg": "jpeg", "image/png": "png",
+                "image/gif": "gif", "image/webp": "webp",
+            }
+            fmt = fmt_map.get(ct.split(";")[0].strip().lower(), "jpeg")
+            try:
+                return [
+                    f"Downloaded {len(body):,} bytes ({ct}) from {url}",
+                    Image(data=body, format=fmt),
+                ]
+            except Exception:
+                return [
+                    f"Downloaded {len(body):,} bytes ({ct}) but failed to encode inline"
+                ]
+        finally:
+            await browser.close()
+
+
+# ---------------------------------------------------------------------------
+# download_file / download_files_from_page
+# ---------------------------------------------------------------------------
+
+# File-type presets for download_files_from_page
+_FILE_TYPE_PRESETS = {
+    "images":    {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "svg", "avif"},
+    "documents": {"pdf", "docx", "doc", "xlsx", "xls", "csv", "txt", "md", "rtf",
+                  "odt", "ods", "odp", "pptx", "ppt"},
+    "videos":    {"mp4", "webm", "mov", "mkv", "avi", "m4v"},
+    "audio":     {"mp3", "wav", "ogg", "m4a", "flac", "aac", "opus"},
+    "archives":  {"zip", "rar", "7z", "tar", "gz", "tgz", "bz2"},
+}
+
+
+def _ext_from_url(url: str) -> str | None:
+    """Pull a file extension from a URL path (ignoring query / fragment)."""
+    try:
+        path = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if "." not in path:
+            return None
+        ext = path.rsplit(".", 1)[-1].lower()
+        if 0 < len(ext) <= 5 and ext.isalnum():
+            return ext
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_file_types(file_types: str) -> set[str] | None:
+    """Translate ``file_types`` arg → set of allowed extensions, or None for any."""
+    if not file_types:
+        return None
+    key = file_types.strip().lower()
+    if key in ("any", "all", "*"):
+        return None
+    if key in _FILE_TYPE_PRESETS:
+        return set(_FILE_TYPE_PRESETS[key])
+    # Comma-separated custom list, e.g. "jpg,png,pdf"
+    out: set[str] = set()
+    for part in key.replace(";", ",").split(","):
+        p = part.strip().lstrip(".")
+        if p:
+            out.add(p)
+    return out or None
+
+
+async def _download_any_bytes(
+    context, url: str, referers: list, timeout_ms: int = 30000, min_bytes: int = 512
+) -> tuple[bytes, str] | None:
+    """Generic file fetch (no image/* content-type check). Tries each referer."""
+    for ref in referers:
+        try:
+            headers = {"Accept": "*/*"}
+            if ref:
+                headers["Referer"] = ref
+            resp = await context.request.get(url, headers=headers, timeout=timeout_ms)
+            if resp.ok:
+                body = await resp.body()
+                if len(body) >= min_bytes:
+                    ct = resp.headers.get("content-type", "application/octet-stream")
+                    return body, ct
+        except Exception:
+            continue
+    return None
+
+
+def _filename_from_url(url: str, fallback_ext: str = "bin") -> str:
+    """Pick a filesystem-safe filename for a URL."""
+    raw = url.split("?", 1)[0].split("#", 1)[0].rstrip("/").split("/")[-1]
+    if not raw:
+        raw = f"file.{fallback_ext}"
+    elif "." not in raw and fallback_ext:
+        raw = f"{raw}.{fallback_ext}"
+    # Strip any path traversal
+    raw = raw.replace("\\", "_").replace("/", "_")
+    return raw[:200] or f"file.{fallback_ext}"
+
+
+@mcp.tool()
+async def download_file(
+    url: str,
+    save_to: str | None = None,
+    referer: str | None = None,
+) -> str:
+    """Download any file (PDF/DOCX/ZIP/video/audio/etc) with anti-hotlink Referer.
+
+    Generic counterpart to ``download_image`` for non-image files. Tries
+    source-domain → Google → no-Referer headers to bypass CDN hotlink
+    protection.
+
+    Sample prompts that trigger this tool:
+        - "Download this PDF: https://example.com/paper.pdf to ~/Documents"
+        - "Save the spec at <url> to my desktop"
+        - "Grab https://site.com/dataset.zip"
+
+    Args:
+        url: Direct URL to the file.
+        save_to: File path or directory to save into. ~ expanded. If a
+            directory or path ending with "/", the filename is derived from
+            the URL. If ``None``, returns size info only (no file written).
+        referer: Custom Referer header. If ``None``, auto-tries source
+            domain → Google → none.
+    """
+    if not url or not url.startswith("http"):
+        return f"Invalid URL: {url!r}"
+
+    if referer:
+        referers: list = [referer]
+    else:
+        try:
+            domain_ref = "/".join(url.split("/", 3)[:3]) + "/"
+        except Exception:
+            domain_ref = None
+        referers = [domain_ref, "https://www.google.com/", None]
+
+    async with async_playwright() as pw:
+        browser, context = await _launch_browser(pw)
+        try:
+            got = await _download_any_bytes(context, url, referers, timeout_ms=45000)
+            if not got:
+                tried = [r for r in referers if r]
+                return f"Download failed for {url} (tried referers: {tried})"
+            body, ct = got
+            ext_from_ct = _ext_from_content_type(ct, fallback="")
+            ext_from_url = _ext_from_url(url) or ""
+            ext = ext_from_url or ext_from_ct or "bin"
+
+            if save_to:
+                target = Path(os.path.expanduser(save_to))
+                if save_to.endswith(("/", os.sep)) or target.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    fname = _filename_from_url(url, fallback_ext=ext)
+                    target = target / fname
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+                return f"Saved {len(body):,} bytes ({ct}) to {target}"
+
+            return (
+                f"Downloaded {len(body):,} bytes ({ct}) from {url} — "
+                f"pass save_to= to write to disk."
+            )
+        finally:
+            await browser.close()
+
+
+_COLLECT_LINKS_JS = r"""
+(cssSel) => {
+    const roots = cssSel ? document.querySelectorAll(cssSel) : [document];
+    const out = [];
+    const seen = new Set();
+    const push = (raw, hint) => {
+        if (!raw) return;
+        let abs;
+        try { abs = new URL(raw, document.baseURI).href; } catch(e) { return; }
+        if (seen.has(abs)) return;
+        seen.add(abs);
+        out.push({url: abs, hint: hint});
+    };
+    const pickFromSrcset = (srcset) => {
+        if (!srcset) return null;
+        const parts = srcset.split(',').map(s => s.trim()).filter(Boolean);
+        let best = null, bestW = -1;
+        for (const p of parts) {
+            const [u, w] = p.split(/\s+/);
+            const wn = w ? parseInt(w.replace(/[^\d]/g, '')) || 0 : 0;
+            if (wn >= bestW) { bestW = wn; best = u; }
+        }
+        return best;
+    };
+    for (const root of roots) {
+        if (!root) continue;
+        // <img>
+        root.querySelectorAll('img').forEach(img => {
+            const src = img.currentSrc || img.src || img.dataset.src
+                || img.dataset.original || img.dataset.lazySrc
+                || img.getAttribute('data-srcset');
+            if (src) push(src, 'img');
+            const big = pickFromSrcset(img.getAttribute('srcset')
+                || img.getAttribute('data-srcset'));
+            if (big) push(big, 'img-srcset');
+        });
+        // <source> inside <picture>/<video>/<audio>
+        root.querySelectorAll('source').forEach(s => {
+            if (s.src) push(s.src, 'source');
+            const big = pickFromSrcset(s.getAttribute('srcset'));
+            if (big) push(big, 'source-srcset');
+        });
+        // <video src>, <audio src>
+        root.querySelectorAll('video[src], audio[src]').forEach(m => push(m.src, 'media'));
+        // <a href>
+        root.querySelectorAll('a[href]').forEach(a => push(a.href, 'link'));
+        // background-image style
+        root.querySelectorAll('[style*="background"]').forEach(el => {
+            const bg = el.style.backgroundImage || '';
+            const m = bg.match(/url\((['"]?)(.*?)\1\)/);
+            if (m && m[2]) push(m[2], 'bg');
+        });
+    }
+    // og:image / twitter:image (always document-level)
+    document.querySelectorAll(
+        'meta[property="og:image"], meta[property="og:image:url"], meta[name="twitter:image"]'
+    ).forEach(m => {
+        const c = m.getAttribute('content');
+        if (c) push(c, 'meta');
+    });
+    return out;
+}
+"""
+
+
+@mcp.tool()
+async def download_files_from_page(
+    url: str,
+    save_to: str,
+    file_types: str = "images",
+    css_selector: str | None = None,
+    min_kb: int = 30,
+    max_files: int = 50,
+    min_image_size: str | None = None,
+) -> str:
+    """Visit a page and bulk-download linked files (images, PDFs, videos, etc).
+
+    Renders the page with the same anti-bot stealth as the rest of the MCP,
+    then collects file URLs from ``<img>``, ``<source>``, ``<a href>``,
+    ``<video>``/``<audio>``, ``og:image``/``twitter:image`` meta, and inline
+    ``background-image`` styles. ``srcset`` is parsed — the highest-resolution
+    variant is chosen. Each candidate is downloaded with the anti-hotlink
+    Referer chain (page URL → site root → none).
+
+    Sample prompts that trigger this tool:
+        - "Download all images from https://example.com/gallery to ~/imgs"
+        - "Grab every PDF on this page: https://..."
+        - "Save photos inside .campus-gallery selector to ~/uni"
+
+    Args:
+        url: Page URL to visit.
+        save_to: Directory to save files into. ~ expanded, created if missing.
+        file_types: Preset (``images``, ``documents``, ``videos``, ``audio``,
+            ``archives``, ``any``) or comma-separated extensions
+            (``"jpg,png,pdf"``). Default ``images``.
+        css_selector: If set, only collect links inside elements matching
+            this CSS selector (``.gallery``, ``article img``, ...).
+        min_kb: Skip files smaller than this many KB (default 30).
+        max_files: Stop after this many successful saves (default 50).
+        min_image_size: When ``file_types`` covers images, also enforce
+            minimum pixel dimensions. Same values as ``google_images``:
+            ``any|large|2mp|fhd|qhd|4mp|8mp|4k``. ``None`` = no check.
+    """
+    if not url or not url.startswith("http"):
+        return f"Invalid page URL: {url!r}"
+
+    save_dir = Path(os.path.expanduser(save_to))
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    allowed_exts = _resolve_file_types(file_types)
+    min_bytes = max(0, int(min_kb) * 1024)
+    max_files = max(1, min(int(max_files), 200))
+
+    img_size_key: str | None = None
+    if min_image_size:
+        ms = min_image_size.lower()
+        if ms in _MIN_DIMS:
+            img_size_key = ms
+
+    page_origin = "/".join(url.split("/", 3)[:3]) + "/"
+    referers = [url, page_origin, "https://www.google.com/", None]
+
+    async with async_playwright() as pw:
+        browser, context = await _launch_browser(pw)
+        try:
+            page = await context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                return f"Could not load page {url}: {e}"
+            await _dismiss_consent(page)
+            await page.wait_for_timeout(1500)
+            # Trigger lazy-load
+            for _ in range(3):
+                try:
+                    await page.evaluate("window.scrollBy(0, 1500)")
+                except Exception:
+                    break
+                await page.wait_for_timeout(700)
+            try:
+                await page.evaluate("window.scrollTo(0, 0)")
+            except Exception:
+                pass
+
+            try:
+                raw = await page.evaluate(_COLLECT_LINKS_JS, css_selector)
+            except Exception as e:
+                return f"Could not parse page DOM: {e}"
+
+            # Filter and dedupe candidates
+            candidates: list[dict] = []
+            seen: set[str] = set()
+            for r in raw or []:
+                u = (r.get("url") or "").strip()
+                if not u or u in seen:
+                    continue
+                if not u.startswith(("http://", "https://")):
+                    continue
+                if allowed_exts is not None:
+                    ext = _ext_from_url(u)
+                    if not ext or ext not in allowed_exts:
+                        continue
+                seen.add(u)
+                candidates.append({"url": u, "hint": r.get("hint", "")})
+
+            if not candidates:
+                return (
+                    f"No matching files found on {url} "
+                    f"(file_types={file_types}, selector={css_selector!r})"
+                )
+
+            # Download loop
+            saved: list[dict] = []
+            errors: list[str] = []
+            tried = 0
+            for cand in candidates:
+                if len(saved) >= max_files:
+                    break
+                tried += 1
+                if tried > max_files * 4:
+                    break  # safety stop
+                got = await _download_any_bytes(
+                    context, cand["url"], referers, timeout_ms=30000,
+                    min_bytes=min_bytes,
+                )
+                if not got:
+                    continue
+                body, ct = got
+                if len(body) < min_bytes:
+                    continue
+
+                ext = _ext_from_url(cand["url"]) or _ext_from_content_type(ct, "bin")
+                # If image-size filter requested, enforce it
+                if img_size_key and img_size_key != "any":
+                    long_min, short_min = _MIN_DIMS[img_size_key]
+                    dims = _measure_image_dims(body)
+                    if dims is None:
+                        continue
+                    rw, rh = dims
+                    if max(rw, rh) < long_min or min(rw, rh) < short_min:
+                        continue
+
+                fname = _filename_from_url(cand["url"], fallback_ext=ext)
+                target = save_dir / fname
+                # Avoid overwriting if a same-named file exists
+                if target.exists():
+                    stem, dot, suf = fname.rpartition(".")
+                    base = stem if dot else fname
+                    suf = suf if dot else ""
+                    n = 2
+                    while True:
+                        cand_name = f"{base}_{n}.{suf}" if suf else f"{base}_{n}"
+                        if not (save_dir / cand_name).exists():
+                            target = save_dir / cand_name
+                            break
+                        n += 1
+                try:
+                    target.write_bytes(body)
+                except Exception as e:
+                    errors.append(f"{cand['url']}: write failed ({e})")
+                    continue
+                saved.append({
+                    "url": cand["url"],
+                    "path": str(target),
+                    "bytes": len(body),
+                    "content_type": ct.split(";", 1)[0].strip(),
+                })
+
+            lines = [
+                f"Downloaded {len(saved)} of {len(candidates)} candidates "
+                f"from {url} → {save_dir}"
+            ]
+            for s in saved:
+                lines.append(
+                    f"  • {s['path']}  ({s['bytes']:,} bytes, {s['content_type']})"
+                )
+            if errors:
+                lines.append("Errors:")
+                for e in errors[:5]:
+                    lines.append(f"  ! {e}")
+            return "\n".join(lines)
         finally:
             await browser.close()
 
