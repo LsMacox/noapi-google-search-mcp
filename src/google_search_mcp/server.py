@@ -304,10 +304,64 @@ _STEALTH_CHROME_ARGS = [
 ]
 
 
+def _proxy_from_env() -> dict | None:
+    """Build a Playwright ``proxy=`` dict from environment variables.
+
+    Recognised (in order of precedence): ``GOOGLE_MCP_PROXY``,
+    ``HTTPS_PROXY``, ``ALL_PROXY``, ``HTTP_PROXY``. Accepts the standard
+    ``scheme://[user:pass@]host:port`` form. Returns ``None`` when no
+    proxy is configured.
+    """
+    raw = (
+        os.environ.get("GOOGLE_MCP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("ALL_PROXY")
+        or os.environ.get("all_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse, unquote
+        u = urlparse(raw if "://" in raw else f"http://{raw}")
+        if not u.hostname or not u.port:
+            return None
+        scheme = (u.scheme or "http").lower()
+        out = {"server": f"{scheme}://{u.hostname}:{u.port}"}
+        if u.username:
+            out["username"] = unquote(u.username)
+        if u.password:
+            out["password"] = unquote(u.password)
+        return out
+    except Exception:
+        return None
+
+
+def _maybe_reset_profile() -> None:
+    """If ``GOOGLE_MCP_RESET_PROFILE`` is truthy, wipe the persistent
+    Chrome profile so the next launch starts with a fresh cookie jar."""
+    flag = os.environ.get("GOOGLE_MCP_RESET_PROFILE", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    try:
+        import shutil
+        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+    except Exception:
+        pass
+    # One-shot: clear the env so we don't wipe again later in the process.
+    try:
+        del os.environ["GOOGLE_MCP_RESET_PROFILE"]
+    except Exception:
+        pass
+
+
 async def _launch_browser(pw, viewport=None):
     """Launch a headless Chromium browser with stealth settings to avoid bot detection."""
     browser = await pw.chromium.launch(
         headless=True,
+        proxy=_proxy_from_env(),
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -362,6 +416,7 @@ async def _launch_stealth_browser(pw, headless: bool = True):
     Returns ``(None, context)`` because persistent contexts have no separate
     browser handle — close ``context`` to shut everything down.
     """
+    _maybe_reset_profile()
     os.makedirs(PROFILE_DIR, exist_ok=True)
     ua = _platform_user_agent()
     base_kwargs = dict(
@@ -375,6 +430,9 @@ async def _launch_stealth_browser(pw, headless: bool = True):
         ignore_https_errors=True,
         bypass_csp=True,
     )
+    proxy = _proxy_from_env()
+    if proxy:
+        base_kwargs["proxy"] = proxy
     tz = _system_timezone_id()
     if tz:
         base_kwargs["timezone_id"] = tz
@@ -467,6 +525,72 @@ async def _is_blocked(page) -> bool:
     except Exception:
         pass
     return False
+
+
+async def _wait_through_sorry(page, timeout_ms: int = 4500) -> bool:
+    """If we're on /sorry/, wait for the invisible reCAPTCHA challenge to
+    auto-clear and Google to redirect back to /search.
+
+    Modern /sorry/ pages auto-run ``solveSimpleChallenge(0,0)`` on load. If
+    the IP/UA risk is moderate, the script silently passes and reloads
+    ``continue=`` URL. We give it up to ~12 seconds before giving up.
+    Returns True if the page left /sorry/, False if it stayed.
+    """
+    if "/sorry/" not in page.url:
+        return True
+    try:
+        async with page.expect_navigation(
+            url=lambda u: "/sorry/" not in u,
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        ):
+            # Try clicking any visible submit/continue button — most /sorry/
+            # forms post back automatically once the challenge resolves; a
+            # nudge helps when the auto-submit didn't fire.
+            try:
+                btn = page.locator(
+                    "#captcha-form button[type='submit'], "
+                    "#captcha-form input[type='submit'], "
+                    "form[action*='sorry'] button[type='submit']"
+                ).first
+                if await btn.count() > 0:
+                    await btn.click(timeout=2000)
+            except Exception:
+                pass
+        return "/sorry/" not in page.url
+    except Exception:
+        return "/sorry/" not in page.url
+
+
+# Alternate Google TLDs to retry against when one is rate-limited. Often a
+# different regional frontend has a separate quota and lets us through.
+# Kept short — every extra attempt is ~15-25s of wasted homepage+typing+sorry.
+_TLD_ROTATION = ["com", "co.uk", "de"]
+
+# Persisted "last TLD that worked" — try it first next time so we don't burn
+# ~20s on a domain we already know is rate-limited for our IP.
+_LAST_GOOD_TLD_PATH = os.path.join(
+    os.path.expanduser("~"), ".google_mcp_last_tld"
+)
+
+
+def _load_last_good_tld() -> str | None:
+    try:
+        with open(_LAST_GOOD_TLD_PATH, "r") as f:
+            tld = f.read().strip()
+        if tld and all(c.isalnum() or c == "." for c in tld):
+            return tld
+    except Exception:
+        pass
+    return None
+
+
+def _save_last_good_tld(tld: str) -> None:
+    try:
+        with open(_LAST_GOOD_TLD_PATH, "w") as f:
+            f.write(tld)
+    except Exception:
+        pass
 
 
 async def _try_solve_captcha(page) -> bool:
@@ -760,6 +884,315 @@ async def _dismiss_consent(page):
 # google_search
 # ---------------------------------------------------------------------------
 
+# DuckDuckGo "df" param (close-enough mapping for Google's tbs=qdr:*).
+# DDG has no past-hour bucket → coalesce to past-day.
+_DDG_TIME_FILTER = {
+    "past_hour":  "d",
+    "past_day":   "d",
+    "past_week":  "w",
+    "past_month": "m",
+    "past_year":  "y",
+}
+
+
+async def _human_type(page, locator, text: str) -> None:
+    """Type into ``locator`` one char at a time with realistic jitter.
+
+    Real keypresses (rather than ``page.fill``) generate the keydown/keyup/
+    beforeinput events Google's bot detector samples.
+    """
+    try:
+        await locator.click(delay=random.randint(30, 80))
+    except Exception:
+        pass
+    for ch in text:
+        try:
+            await page.keyboard.type(ch, delay=random.randint(20, 70))
+        except Exception:
+            return
+        # Rare tiny pause mid-word — keep one in to avoid uniform cadence
+        if random.random() < 0.04:
+            await page.wait_for_timeout(random.randint(120, 260))
+
+
+async def _scrape_google_serp(
+    context,
+    query: str,
+    num_results: int,
+    *,
+    site: str | None,
+    time_range: str | None,
+    language: str | None,
+    region: str | None,
+    page_num: int,
+    warmup: bool,
+    tld: str = "com",
+) -> tuple[list[dict], bool]:
+    """One Google web-SERP attempt against an open context.
+
+    Drives the search like a human: hits ``google.com``, types into the real
+    search box, presses Enter, then (only if filters/pagination are needed)
+    refines the resulting URL — never navigates cold to ``/search?q=``.
+    Returns (results, blocked). ``blocked`` is True if /sorry/ or a CAPTCHA
+    survived our solve attempt.
+    """
+    typed = query if not site else f"site:{site} {query}"
+
+    home = f"https://www.google.{tld}/?hl=en"
+    if language:
+        home = f"https://www.google.{tld}/?hl={language}"
+        if region:
+            home += f"&gl={region}"
+
+    page = await context.new_page()
+    try:
+        try:
+            await page.goto(home, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            return [], False
+        await _dismiss_consent(page)
+
+        # Tiny mouse jitter — the homepage navigation itself is the warmup,
+        # we just want a non-zero cursor track before the click.
+        if warmup:
+            try:
+                await page.mouse.move(
+                    random.randint(200, 900),
+                    random.randint(150, 500),
+                    steps=random.randint(6, 12),
+                )
+                await page.wait_for_timeout(random.randint(80, 180))
+            except Exception:
+                pass
+
+        # Find the real search box. Modern Google uses <textarea name=q>;
+        # older variants and simplified pages use <input name=q>.
+        search_box = page.locator("textarea[name='q'], input[name='q']").first
+        try:
+            await search_box.wait_for(state="visible", timeout=15000)
+        except Exception:
+            if await _is_blocked(page):
+                return [], True
+            return [], False
+
+        await _human_type(page, search_box, typed)
+        await page.wait_for_timeout(random.randint(120, 320))
+        try:
+            await page.keyboard.press("Enter")
+        except Exception:
+            return [], False
+
+        try:
+            await page.wait_for_load_state(
+                "domcontentloaded", timeout=20000
+            )
+        except Exception:
+            pass
+
+        if await _is_blocked(page):
+            # Try the invisible-challenge auto-pass first — much cheaper than
+            # the visible reCAPTCHA solver and often succeeds when the IP is
+            # only mildly suspicious.
+            if not await _wait_through_sorry(page):
+                solved = await _try_solve_captcha(page)
+                if not solved:
+                    return [], True
+
+        # Apply filters / pagination by tweaking the post-search URL. By now
+        # we already have google.com cookies + a referer chain, so this nav
+        # is "warm" rather than cold.
+        needs_refine = bool(time_range) or page_num > 1
+        if needs_refine:
+            from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+            cur = urlparse(page.url)
+            qs = dict(parse_qsl(cur.query, keep_blank_values=True))
+            if time_range and time_range in TIME_RANGE_MAP:
+                qs["tbs"] = TIME_RANGE_MAP[time_range]
+            if page_num > 1:
+                qs["start"] = str((page_num - 1) * num_results)
+            refined = urlunparse(cur._replace(query=urlencode(qs)))
+            try:
+                await page.goto(
+                    refined, wait_until="domcontentloaded", timeout=20000
+                )
+            except Exception:
+                pass
+            if await _is_blocked(page):
+                if not await _wait_through_sorry(page):
+                    solved = await _try_solve_captcha(page)
+                    if not solved:
+                        return [], True
+
+        try:
+            await page.wait_for_selector("div#search", timeout=15000)
+        except Exception:
+            if await _is_blocked(page):
+                return [], True
+            return [], False
+
+        results = await page.evaluate(
+            """
+            (numResults) => {
+                const out = [];
+                const containers = document.querySelectorAll('div#search div.g');
+                for (const el of containers) {
+                    if (out.length >= numResults) break;
+                    const linkEl = el.querySelector('a[href^="http"]');
+                    const titleEl = el.querySelector('h3');
+                    const snippetEl = el.querySelector(
+                        'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
+                    );
+                    if (linkEl && titleEl) {
+                        out.push({
+                            title: titleEl.innerText.trim(),
+                            url: linkEl.href,
+                            snippet: snippetEl ? snippetEl.innerText.trim() : ''
+                        });
+                    }
+                }
+                if (out.length === 0) {
+                    const allLinks = document.querySelectorAll('div#search a[href^="http"]');
+                    for (const a of allLinks) {
+                        if (out.length >= numResults) break;
+                        const h3 = a.querySelector('h3');
+                        if (h3) {
+                            const parent = a.closest('div.g') || a.parentElement?.parentElement;
+                            const snippetEl = parent?.querySelector(
+                                'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
+                            );
+                            out.push({
+                                title: h3.innerText.trim(),
+                                url: a.href,
+                                snippet: snippetEl ? snippetEl.innerText.trim() : ''
+                            });
+                        }
+                    }
+                }
+                return out;
+            }
+            """,
+            num_results,
+        )
+        return results or [], False
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def _ddg_web_search(
+    context,
+    query: str,
+    num_results: int,
+    time_range: str | None,
+    language: str | None,
+    region: str | None,
+    page_num: int,
+) -> list[dict]:
+    """Fallback web search via DuckDuckGo's HTML endpoint.
+
+    Bing's PoW interstitial blocks bundled Chromium; DDG's html endpoint
+    serves a clean SERP through the same stealth context that handles Google.
+    Returns list of {title,url,snippet}.
+    """
+    encoded = quote_plus(query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    if language and region:
+        url += f"&kl={region.lower()}-{language.lower()}"
+    elif language:
+        url += f"&kl=wt-{language.lower()}"
+    if time_range and time_range in _DDG_TIME_FILTER:
+        url += f"&df={_DDG_TIME_FILTER[time_range]}"
+    if page_num > 1:
+        url += f"&s={(page_num - 1) * num_results}"
+
+    page = await context.new_page()
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            return []
+        try:
+            await page.wait_for_selector("div.result a.result__a", timeout=10000)
+        except Exception:
+            return []
+        results = await page.evaluate(
+            """
+            (numResults) => {
+                const out = [];
+                const items = document.querySelectorAll('div.result');
+                for (const el of items) {
+                    if (out.length >= numResults) break;
+                    if (el.classList.contains('result--ad')) continue;
+                    const a = el.querySelector('a.result__a');
+                    if (!a) continue;
+                    let href = a.href || '';
+                    // DDG wraps URLs in /l/?uddg=<encoded>; unwrap.
+                    try {
+                        const u = new URL(href);
+                        const inner = u.searchParams.get('uddg');
+                        if (inner) href = decodeURIComponent(inner);
+                    } catch (e) {}
+                    if (!/^https?:\\/\\//.test(href)) continue;
+                    const snipEl = el.querySelector('a.result__snippet, .result__snippet');
+                    out.push({
+                        title: (a.innerText || a.textContent || '').trim(),
+                        url: href,
+                        snippet: snipEl ? (snipEl.innerText || '').trim() : ''
+                    });
+                }
+                return out;
+            }
+            """,
+            num_results,
+        )
+        return results or []
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+def _format_serp(
+    query: str,
+    results: list[dict],
+    *,
+    num_results: int,
+    page: int,
+    time_range: str | None,
+    site: str | None,
+    language: str | None,
+    region: str | None,
+    engine: str = "Google",
+    note: str = "",
+) -> str:
+    header = f"{engine} Search Results for: {query}"
+    if time_range:
+        header += f" (filtered: {time_range.replace('_', ' ')})"
+    if site:
+        header += f" (site: {site})"
+    if language:
+        header += f" (lang: {language})"
+    if region:
+        header += f" (region: {region})"
+    if page > 1:
+        header += f" (page {page})"
+    if note:
+        header += f" — {note}"
+
+    lines = [header + "\n"]
+    offset = (page - 1) * num_results
+    for i, r in enumerate(results[:num_results], offset + 1):
+        lines.append(f"{i}. {r['title']}")
+        lines.append(f"   URL: {r['url']}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 async def _do_google_search(
     query: str,
     num_results: int = 5,
@@ -768,135 +1201,96 @@ async def _do_google_search(
     page: int = 1,
     language: str | None = None,
     region: str | None = None,
+    fallback_web: bool = True,
 ) -> str:
-    """Launch headless Chromium, search Google, and scrape results."""
-    search_query = query
-    if site:
-        search_query = f"site:{site} {search_query}"
-
-    encoded_query = quote_plus(search_query)
-    start = (page - 1) * num_results
-    url = f"https://www.google.com/search?q={encoded_query}&num={num_results + 5}"
-
-    # Language and region
-    if language:
-        url += f"&lr=lang_{language}&hl={language}"
-    else:
-        url += "&hl=en"
-    if region:
-        url += f"&gl={region}"
-
-    if start > 0:
-        url += f"&start={start}"
-    if time_range and time_range in TIME_RANGE_MAP:
-        url += f"&tbs={TIME_RANGE_MAP[time_range]}"
+    """Launch a stealth Chrome and search Google by typing into the homepage
+    search box (no cold ``/search?q=`` navigation — that's the main /sorry/
+    trigger). Falls back to DuckDuckGo only if Google still blocks."""
 
     async with async_playwright() as pw:
-        browser, context = await _launch_browser(pw)
-        await _load_cookies(context)
-        browser_page = await context.new_page()
+        results: list[dict] = []
+        blocked = False
+        ctx_persistent = None
 
         try:
-            await browser_page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await _dismiss_consent(browser_page)
+            _, ctx_persistent = await _launch_stealth_browser(pw)
+        except Exception:
+            ctx_persistent = None
 
-            # Detect and handle CAPTCHA/rate-limit blocks
-            if await _is_blocked(browser_page):
-                solved = await _try_solve_captcha(browser_page)
-                if not solved:
-                    await _save_cookies(context)
-                    return (
-                        "Search blocked by Google bot detection. "
-                        "Your IP may be temporarily rate-limited. "
-                        "Try again in a few minutes or from a different network."
+        if ctx_persistent is not None:
+            # Try a few Google TLDs — if one is rate-limited, others often
+            # have a separate quota for the same IP. Last-good TLD goes
+            # first so we don't burn time on a domain we already know is
+            # blocked for this IP.
+            tlds: list[str] = []
+            cached = _load_last_good_tld()
+            if cached:
+                tlds.append(cached)
+            for t in _TLD_ROTATION:
+                if t not in tlds:
+                    tlds.append(t)
+
+            for attempt, tld in enumerate(tlds):
+                try:
+                    results, blocked = await _scrape_google_serp(
+                        ctx_persistent,
+                        query,
+                        num_results,
+                        site=site,
+                        time_range=time_range,
+                        language=language,
+                        region=region,
+                        page_num=page,
+                        warmup=(attempt == 0),
+                        tld=tld,
                     )
+                except Exception:
+                    results, blocked = [], False
+                if results:
+                    _save_last_good_tld(tld)
+                    break
+                if not blocked:
+                    # Empty SERP from a non-blocked attempt → no point
+                    # rotating TLDs, the query genuinely has no hits.
+                    break
 
-            await browser_page.wait_for_selector("div#search", timeout=15000)
+        # Fallback: DuckDuckGo only if Google was actually unreachable.
+        engine = "Google"
+        note = ""
+        if not results and fallback_web and ctx_persistent is not None:
+            try:
+                ddg = await _ddg_web_search(
+                    ctx_persistent, query, num_results,
+                    time_range, language, region, page,
+                )
+                if ddg:
+                    results = ddg
+                    engine = "DuckDuckGo"
+                    note = "Google blocked, used DuckDuckGo fallback"
+            except Exception:
+                pass
 
-            results = await browser_page.evaluate(
-                """
-                (numResults) => {
-                    const results = [];
-                    const containers = document.querySelectorAll('div#search div.g');
-                    for (const el of containers) {
-                        if (results.length >= numResults) break;
-                        const linkEl = el.querySelector('a[href^="http"]');
-                        const titleEl = el.querySelector('h3');
-                        const snippetEl = el.querySelector(
-                            'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
-                        );
-                        if (linkEl && titleEl) {
-                            results.push({
-                                title: titleEl.innerText.trim(),
-                                url: linkEl.href,
-                                snippet: snippetEl ? snippetEl.innerText.trim() : ''
-                            });
-                        }
-                    }
-                    if (results.length === 0) {
-                        const allLinks = document.querySelectorAll('div#search a[href^="http"]');
-                        for (const a of allLinks) {
-                            if (results.length >= numResults) break;
-                            const h3 = a.querySelector('h3');
-                            if (h3) {
-                                const parent = a.closest('div.g') || a.parentElement?.parentElement;
-                                const snippetEl = parent?.querySelector(
-                                    'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
-                                );
-                                results.push({
-                                    title: h3.innerText.trim(),
-                                    url: a.href,
-                                    snippet: snippetEl ? snippetEl.innerText.trim() : ''
-                                });
-                            }
-                        }
-                    }
-                    return results;
-                }
-                """,
-                num_results,
-            )
+        if ctx_persistent is not None:
+            try:
+                await ctx_persistent.close()
+            except Exception:
+                pass
 
-            if not results:
-                return f"No results found for: {query}"
-
-            header = f"Google Search Results for: {query}"
-            if time_range:
-                header += f" (filtered: {time_range.replace('_', ' ')})"
-            if site:
-                header += f" (site: {site})"
-            if language:
-                header += f" (lang: {language})"
-            if region:
-                header += f" (region: {region})"
-            if page > 1:
-                header += f" (page {page})"
-
-            lines = [header + "\n"]
-            offset = (page - 1) * num_results
-            for i, r in enumerate(results[:num_results], offset + 1):
-                lines.append(f"{i}. {r['title']}")
-                lines.append(f"   URL: {r['url']}")
-                if r.get("snippet"):
-                    lines.append(f"   {r['snippet']}")
-                lines.append("")
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            # Check if the exception was due to bot detection
-            if await _is_blocked(browser_page):
-                await _save_cookies(context)
+        if not results:
+            if blocked:
                 return (
-                    "Search blocked by Google bot detection. "
-                    "Your IP may be temporarily rate-limited. "
+                    "Search blocked by Google bot detection and DuckDuckGo "
+                    "fallback returned nothing. Your IP may be rate-limited. "
                     "Try again in a few minutes or from a different network."
                 )
-            return f"Search failed: {e}"
+            return f"No results found for: {query}"
 
-        finally:
-            await _save_cookies(context)
-            await browser.close()
+        return _format_serp(
+            query, results,
+            num_results=num_results, page=page, time_range=time_range,
+            site=site, language=language, region=region,
+            engine=engine, note=note,
+        )
 
 
 @mcp.tool()
@@ -908,8 +1302,21 @@ async def google_search(
     page: int = 1,
     language: str = "",
     region: str = "",
+    fallback_web: bool = True,
 ) -> str:
     """Search Google and return results with titles, URLs, and snippets.
+
+    Drives a stealth Chrome (persistent profile) by typing into the real
+    google.com search box, rotates across a few Google TLDs when one is
+    rate-limited, and falls back to DuckDuckGo only as a last resort.
+
+    Environment variables:
+        GOOGLE_MCP_PROXY (or HTTPS_PROXY / ALL_PROXY / HTTP_PROXY): proxy
+            URL, e.g. ``http://user:pass@host:3128`` or ``socks5://host:1080``.
+            Applied to both the stealth context and any fallback browser.
+        GOOGLE_MCP_RESET_PROFILE=1: wipe the persistent profile directory
+            (``~/.cache/noapi-google-search-mcp/profile``) on next launch.
+            Useful when Google has flagged the existing cookie set.
 
     Sample prompts that trigger this tool:
         - "Search for the best Python web frameworks"
@@ -928,6 +1335,7 @@ async def google_search(
         page: Results page number (default 1). Use 2, 3, etc. to get more results.
         language: Language code for results (e.g. "en", "de", "fr", "es", "ja", "zh"). Leave empty for English.
         region: Country/region code (e.g. "us", "gb", "de", "fr", "jp"). Leave empty for default.
+        fallback_web: Fall back to DuckDuckGo on Google block (default True).
     """
     num_results = max(1, min(num_results, 10))
     page = max(1, min(page, 10))
@@ -939,6 +1347,7 @@ async def google_search(
         page=page,
         language=language or None,
         region=region or None,
+        fallback_web=fallback_web,
     )
 
 
