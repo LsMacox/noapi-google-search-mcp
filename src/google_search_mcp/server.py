@@ -62,31 +62,87 @@ from playwright.async_api import async_playwright
 mcp = FastMCP("google-search")
 
 import platform as _platform
+import shutil
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+# Fallback Chrome major used only when we can't read the installed browser's
+# version. Kept reasonably current — a years-old UA is itself a bot signal.
+_FALLBACK_CHROME_MAJOR = "141"
 
-USER_AGENT_MAC = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+_UA_TEMPLATES = {
+    "darwin": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ),
+    "windows": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ),
+    "linux": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ),
+}
 
-USER_AGENT_WIN = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+_CHROME_MAJOR_CACHE: str | None = None
+
+
+def _detect_chrome_major() -> str:
+    """Major version of the installed Google Chrome, as a string (cached).
+
+    The stealth path launches the *real* installed Chrome (``channel='chrome'``).
+    The UA string we send MUST match that version — otherwise it contradicts the
+    ``Sec-CH-UA`` client hints and ``navigator.userAgentData`` that the real
+    browser emits automatically, which is a hard, deterministic bot signal that
+    Google's detection keys on.
+    """
+    global _CHROME_MAJOR_CACHE
+    if _CHROME_MAJOR_CACHE:
+        return _CHROME_MAJOR_CACHE
+    s = _platform.system().lower()
+    if s == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    elif s == "windows":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    else:
+        candidates = [
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            shutil.which("chromium"),
+            shutil.which("chromium-browser"),
+        ]
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            out = subprocess.check_output([path, "--version"], text=True, timeout=4)
+            m = re.search(r"(\d+)\.\d+\.\d+", out)
+            if m:
+                _CHROME_MAJOR_CACHE = m.group(1)
+                return _CHROME_MAJOR_CACHE
+        except Exception:
+            continue
+    _CHROME_MAJOR_CACHE = _FALLBACK_CHROME_MAJOR
+    return _CHROME_MAJOR_CACHE
+
+
+# Static constants kept for non-stealth helpers (e.g. plain urllib requests).
+USER_AGENT = _UA_TEMPLATES["linux"].format(major=_FALLBACK_CHROME_MAJOR)
+USER_AGENT_MAC = _UA_TEMPLATES["darwin"].format(major=_FALLBACK_CHROME_MAJOR)
+USER_AGENT_WIN = _UA_TEMPLATES["windows"].format(major=_FALLBACK_CHROME_MAJOR)
 
 
 def _platform_user_agent() -> str:
-    """Pick a UA string matching the current OS so OS hints stay consistent."""
+    """UA for the current OS, version-matched to the installed Chrome so the UA
+    header stays consistent with the browser's real Client Hints."""
     s = _platform.system().lower()
-    if s == "darwin":
-        return USER_AGENT_MAC
-    if s == "windows":
-        return USER_AGENT_WIN
-    return USER_AGENT
+    tmpl = _UA_TEMPLATES.get(s, _UA_TEMPLATES["linux"])
+    return tmpl.format(major=_detect_chrome_major())
 
 
 # Persistent browser profile dir (cookies, history, localStorage). Google sees
@@ -95,173 +151,66 @@ PROFILE_DIR = os.path.join(
     os.path.expanduser("~"), ".cache", "noapi-google-search-mcp", "profile"
 )
 
-# Strong stealth JS — extends the basic patches with WebGL/audio fingerprint
-# spoofing, chrome.app/csi/loadTimes, realistic hardware metrics, iframe leak
-# fix, Function.prototype.toString native check, and webdriver removal at the
-# prototype level. Patches ALL the surface area Google's bot-detection samples.
+# Minimal stealth JS for the REAL installed Chrome (channel="chrome").
+# Lesson from live A/B testing against Google: heavy fingerprint spoofing
+# (fake WebGL vendor, fake plugins, chrome.* shims, a Proxy on
+# Function.prototype.toString) makes a *real* browser look fake and gets us
+# /sorry/-blocked. A genuine Chrome only needs two touches to pass: hide the
+# `navigator.webdriver` automation flag and keep `languages` populated.
 STEALTH_JS = """
 (() => {
-    // ---- navigator overrides ----
     try { Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true }); } catch(e){}
     try { delete Navigator.prototype.webdriver; } catch(e){}
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true });
+    try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true }); } catch(e){}
+    // Drop any leftover automation globals without touching real Chrome APIs.
+    try { delete window.__playwright; } catch(e) {}
+    try { delete window.__pw_manual; } catch(e) {}
+    Object.keys(window).forEach(k => { if (k.indexOf('cdc_') === 0) { try { delete window[k]; } catch(e) {} } });
+})();
+"""
 
-    // platform stays driven by UA, but make sure it's not "" (headless leak)
-    if (!navigator.platform || navigator.platform === '') {
-        try { Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel', configurable: true }); } catch(e){}
-    }
-
-    // network connection (real Chrome exposes this)
-    if (!navigator.connection) {
-        try {
-            Object.defineProperty(navigator, 'connection', {
-                get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null }),
-                configurable: true,
-            });
-        } catch(e){}
-    }
-
-    // ---- plugins / mimeTypes (PDF Viewer is present on real Chrome) ----
-    const fakePlugin = (name, filename) => {
-        const p = { name, filename, description: 'Portable Document Format', length: 1 };
+# Extra patches applied ONLY when we fall back to the bundled Chromium build
+# (real Chrome unavailable). Bundled Chromium genuinely leaks a SwiftShader/
+# "Google Inc." WebGL renderer and an empty plugins list, so here spoofing is a
+# net win — unlike with real Chrome, where the native values are already
+# legitimate. Deliberately omits the toString Proxy (itself detectable).
+STEALTH_JS_CHROMIUM_EXTRA = """
+(() => {
+    const fakePlugin = (name) => {
+        const p = { name, filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 };
         const m = { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: p };
-        p[0] = m;
-        p.item = i => p[i];
-        p.namedItem = n => (m.type === n ? m : null);
+        p[0] = m; p.item = i => p[i]; p.namedItem = n => (m.type === n ? m : null);
         return p;
     };
-    const pluginsArr = [
-        fakePlugin('PDF Viewer', 'internal-pdf-viewer'),
-        fakePlugin('Chrome PDF Viewer', 'internal-pdf-viewer'),
-        fakePlugin('Chromium PDF Viewer', 'internal-pdf-viewer'),
-        fakePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer'),
-        fakePlugin('WebKit built-in PDF', 'internal-pdf-viewer'),
-    ];
+    const pluginsArr = [fakePlugin('PDF Viewer'), fakePlugin('Chrome PDF Viewer'), fakePlugin('Chromium PDF Viewer')];
     pluginsArr.item = i => pluginsArr[i];
     pluginsArr.namedItem = n => pluginsArr.find(p => p.name === n) || null;
     pluginsArr.refresh = () => {};
-    Object.defineProperty(navigator, 'plugins', { get: () => pluginsArr, configurable: true });
+    try { Object.defineProperty(navigator, 'plugins', { get: () => pluginsArr, configurable: true }); } catch(e){}
 
-    // ---- window.chrome (full surface, not just .runtime) ----
     window.chrome = window.chrome || {};
-    if (!window.chrome.runtime) {
-        window.chrome.runtime = {
-            PlatformOs:   { MAC:'mac', WIN:'win', ANDROID:'android', CROS:'cros', LINUX:'linux', OPENBSD:'openbsd' },
-            PlatformArch: { ARM:'arm', X86_32:'x86-32', X86_64:'x86-64' },
-            RequestUpdateCheckStatus: { THROTTLED:'throttled', NO_UPDATE:'no_update', UPDATE_AVAILABLE:'update_available' },
-            OnInstalledReason: { INSTALL:'install', UPDATE:'update', CHROME_UPDATE:'chrome_update', SHARED_MODULE_UPDATE:'shared_module_update' },
-            OnRestartRequiredReason: { APP_UPDATE:'app_update', OS_UPDATE:'os_update', PERIODIC:'periodic' },
-            connect: () => undefined,
-            sendMessage: () => undefined,
-            onMessage:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
-            onConnect:  { addListener: () => {}, removeListener: () => {}, hasListener: () => false },
-            id: undefined,
-        };
-    }
-    if (!window.chrome.app) {
-        window.chrome.app = {
-            isInstalled: false,
-            InstallState: { DISABLED:'disabled', INSTALLED:'installed', NOT_INSTALLED:'not_installed' },
-            RunningState: { CANNOT_RUN:'cannot_run', READY_TO_RUN:'ready_to_run', RUNNING:'running' },
-            getDetails: () => null,
-            getIsInstalled: () => false,
-        };
-    }
-    if (!window.chrome.csi) {
-        window.chrome.csi = function() {
-            return { onloadT: Date.now(), pageT: performance.now(), startE: Date.now() - 1000, tran: 15 };
-        };
-    }
-    if (!window.chrome.loadTimes) {
-        window.chrome.loadTimes = function() {
-            const t = Date.now() / 1000;
-            return {
-                requestTime: t - 1, startLoadTime: t - 1, commitLoadTime: t - 0.5,
-                finishDocumentLoadTime: t - 0.2, finishLoadTime: t,
-                firstPaintTime: t - 0.1, firstPaintAfterLoadTime: 0,
-                navigationType: 'Other', wasFetchedViaSpdy: true,
-                wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2',
-                wasAlternateProtocolAvailable: false, connectionInfo: 'h2',
-            };
-        };
-    }
+    if (!window.chrome.runtime) { window.chrome.runtime = { connect: () => undefined, sendMessage: () => undefined }; }
 
-    // ---- WebGL fingerprint spoof (UNMASKED_VENDOR / UNMASKED_RENDERER) ----
-    // Real Chrome on Mac reports e.g. "Apple Inc." / "Apple GPU".
-    // Headless Chromium reports "Google Inc." / "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620, ...)" or SwiftShader.
+    // Mask the headless SwiftShader / "Google Inc." WebGL renderer with a
+    // generic desktop GPU so it doesn't scream "automation".
     const _fakeGL = function(orig, p) {
-        if (p === 0x9245) return 'Apple Inc.';
-        if (p === 0x9246) return 'Apple M1';
+        if (p === 0x9245) return 'Intel Inc.';
+        if (p === 0x9246) return 'Intel Iris OpenGL Engine';
         return orig.call(this, p);
     };
     if (window.WebGLRenderingContext) {
-        const proto1 = WebGLRenderingContext.prototype;
-        const _gp1 = proto1.getParameter;
+        const proto1 = WebGLRenderingContext.prototype; const _gp1 = proto1.getParameter;
         proto1.getParameter = function(p) { return _fakeGL.call(this, _gp1, p); };
     }
     if (window.WebGL2RenderingContext) {
-        const proto2 = WebGL2RenderingContext.prototype;
-        const _gp2 = proto2.getParameter;
+        const proto2 = WebGL2RenderingContext.prototype; const _gp2 = proto2.getParameter;
         proto2.getParameter = function(p) { return _fakeGL.call(this, _gp2, p); };
     }
-
-    // ---- Permissions: notifications must be 'default' not 'denied' (headless leak) ----
     if (navigator.permissions && navigator.permissions.query) {
         const _origQ = navigator.permissions.query.bind(navigator.permissions);
-        navigator.permissions.query = (params) => {
-            if (params && params.name === 'notifications') {
-                return Promise.resolve({ state: 'default', onchange: null });
-            }
-            return _origQ(params);
-        };
+        navigator.permissions.query = (params) => (params && params.name === 'notifications')
+            ? Promise.resolve({ state: 'default', onchange: null }) : _origQ(params);
     }
-
-    // ---- iframe contentWindow leak fix (some scripts probe this) ----
-    try {
-        const _cw = HTMLIFrameElement.prototype.__lookupGetter__('contentWindow');
-        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-            get: function() { return _cw.call(this) || window; },
-            configurable: true,
-        });
-    } catch(e) {}
-
-    // ---- Function.prototype.toString — keep "[native code]" for our patched fns ----
-    const _origToString = Function.prototype.toString;
-    Function.prototype.toString = new Proxy(_origToString, {
-        apply: function(target, thisArg, args) {
-            try {
-                const name = thisArg && thisArg.name ? thisArg.name : '';
-                // Heuristic: if our shimmed methods were touched, claim native
-                if (name === 'getParameter' || name === 'query' || name === 'sendMessage') {
-                    return 'function ' + name + '() { [native code] }';
-                }
-            } catch(e) {}
-            return target.apply(thisArg, args);
-        },
-    });
-
-    // ---- remove playwright/cdc/automation traces ----
-    try { delete window.__playwright; } catch(e) {}
-    try { delete window.__pw_manual; } catch(e) {}
-    try { delete window.__PW_inspect; } catch(e) {}
-    Object.keys(window).forEach(k => {
-        if (k.startsWith('cdc_')) { try { delete window[k]; } catch(e) {} }
-    });
-
-    // ---- screen consistency (headless sometimes reports 0x0) ----
-    try {
-        if (!screen.width || !screen.height) {
-            Object.defineProperty(screen, 'width', { get: () => 1366, configurable: true });
-            Object.defineProperty(screen, 'height', { get: () => 768, configurable: true });
-            Object.defineProperty(screen, 'availWidth', { get: () => 1366, configurable: true });
-            Object.defineProperty(screen, 'availHeight', { get: () => 768, configurable: true });
-            Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
-            Object.defineProperty(screen, 'pixelDepth', { get: () => 24, configurable: true });
-        }
-    } catch(e){}
 })();
 """
 
@@ -275,31 +224,18 @@ TIME_RANGE_MAP = {
 }
 
 
+# Minimal, proven-good launch args. The single must-have is
+# --disable-blink-features=AutomationControlled (hides the automation flag);
+# the rest just suppress first-run / keychain prompts. A bigger --disable-*
+# wall measurably HURT pass rate in live testing, so it's gone — every extra
+# flag nudges the fingerprint further from a real user's Chrome.
 _STEALTH_CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process,AutomationControlled",
-    "--disable-dev-shm-usage",
-    "--disable-infobars",
-    "--no-default-browser-check",
     "--no-first-run",
+    "--no-default-browser-check",
     "--password-store=basic",
     "--use-mock-keychain",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-background-networking",
-    "--disable-breakpad",
-    "--disable-client-side-phishing-detection",
-    "--disable-component-update",
-    "--disable-default-apps",
-    "--disable-domain-reliability",
-    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
-    "--disable-hang-monitor",
-    "--disable-ipc-flooding-protection",
-    "--disable-popup-blocking",
-    "--disable-prompt-on-repost",
-    "--disable-renderer-backgrounding",
-    "--disable-sync",
-    "--metrics-recording-only",
-    "--no-pings",
+    "--disable-infobars",
     "--window-size=1366,820",
 ]
 
@@ -445,6 +381,10 @@ async def _launch_stealth_browser(pw, headless: bool = True):
                 kwargs["channel"] = channel
             ctx = await pw.chromium.launch_persistent_context(**kwargs)
             await ctx.add_init_script(STEALTH_JS)
+            # Heavier fingerprint patches only help the bundled-Chromium
+            # fallback (channel is None); on real Chrome they hurt.
+            if channel is None:
+                await ctx.add_init_script(STEALTH_JS_CHROMIUM_EXTRA)
             return None, ctx
         except Exception as e:
             last_err = e
@@ -1012,8 +952,12 @@ async def _scrape_google_serp(
                 qs["start"] = str((page_num - 1) * num_results)
             refined = urlunparse(cur._replace(query=urlencode(qs)))
             try:
+                # Pass the current SERP as Referer so the filter/pagination nav
+                # reads as a continuation of the session rather than a cold
+                # hit on /search?tbs=… — the latter is a strong /sorry/ trigger.
                 await page.goto(
-                    refined, wait_until="domcontentloaded", timeout=20000
+                    refined, wait_until="domcontentloaded", timeout=20000,
+                    referer=page.url,
                 )
             except Exception:
                 pass
@@ -1030,42 +974,65 @@ async def _scrape_google_serp(
                 return [], True
             return [], False
 
+        # `div#search` appears before the organic list finishes hydrating, so
+        # extracting immediately can catch only the first result or two. Wait
+        # for the first <h3>, then poll until the count stops growing (~2s cap).
+        try:
+            await page.wait_for_selector("div#search h3, #rso h3", timeout=8000)
+        except Exception:
+            pass
+        prev = -1
+        for _ in range(8):
+            cnt = await page.evaluate(
+                "() => document.querySelectorAll('#search h3, #rso h3').length"
+            )
+            if cnt and cnt == prev:
+                break
+            prev = cnt
+            await page.wait_for_timeout(250)
+
         results = await page.evaluate(
             """
             (numResults) => {
+                const SNIPPET_SEL = 'div.VwiC3b, div[data-sncf], span.aCOpRe, ' +
+                    'div[style*="-webkit-line-clamp"], div[style*="line-clamp"]';
+                const isJunk = (u) => !u || !/^https?:\\/\\//.test(u) ||
+                    /google\\.[a-z.]+\\/(search|preferences|aclk|imgres|url\\?)/.test(u) ||
+                    /(^|\\.)googleusercontent\\.com|webcache\\.googleusercontent/.test(u);
                 const out = [];
-                const containers = document.querySelectorAll('div#search div.g');
-                for (const el of containers) {
+                const seen = new Set();
+                const push = (title, url, snip) => {
+                    title = (title || '').trim();
+                    if (!title || isJunk(url) || seen.has(url)) return;
+                    seen.add(url);
+                    out.push({ title, url, snippet: (snip || '').trim() });
+                };
+                // Modern result blocks: Google dropped the old `div.g` wrapper.
+                // .tF2Cxc is the organic result container; .MjjYud wraps it.
+                let blocks = document.querySelectorAll(
+                    '#search div.tF2Cxc, #rso div.tF2Cxc, #search div.MjjYud, ' +
+                    '#rso div.MjjYud, #search div.g'
+                );
+                for (const b of blocks) {
                     if (out.length >= numResults) break;
-                    const linkEl = el.querySelector('a[href^="http"]');
-                    const titleEl = el.querySelector('h3');
-                    const snippetEl = el.querySelector(
-                        'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
-                    );
-                    if (linkEl && titleEl) {
-                        out.push({
-                            title: titleEl.innerText.trim(),
-                            url: linkEl.href,
-                            snippet: snippetEl ? snippetEl.innerText.trim() : ''
-                        });
-                    }
+                    const h3 = b.querySelector('h3');
+                    const a = b.querySelector('a[href^="http"]');
+                    if (!h3 || !a) continue;
+                    push(h3.innerText, a.href, (b.querySelector(SNIPPET_SEL) || {}).innerText);
                 }
-                if (out.length === 0) {
-                    const allLinks = document.querySelectorAll('div#search a[href^="http"]');
-                    for (const a of allLinks) {
+                // Top-up: anchor on every <h3> and climb to its link. Runs
+                // whenever the block pass came up short, not only at zero, so
+                // layouts that mix .tF2Cxc with bare .MjjYud still fill out.
+                if (out.length < numResults) {
+                    for (const h3 of document.querySelectorAll('#search h3, #rso h3')) {
                         if (out.length >= numResults) break;
-                        const h3 = a.querySelector('h3');
-                        if (h3) {
-                            const parent = a.closest('div.g') || a.parentElement?.parentElement;
-                            const snippetEl = parent?.querySelector(
-                                'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
-                            );
-                            out.push({
-                                title: h3.innerText.trim(),
-                                url: a.href,
-                                snippet: snippetEl ? snippetEl.innerText.trim() : ''
-                            });
-                        }
+                        const a = h3.closest('a[href^="http"]') ||
+                            h3.parentElement?.querySelector('a[href^="http"]');
+                        if (!a) continue;
+                        const block = h3.closest('div.tF2Cxc, div.MjjYud, div.g') ||
+                            a.parentElement?.parentElement;
+                        push(h3.innerText, a.href,
+                            block ? (block.querySelector(SNIPPET_SEL) || {}).innerText : '');
                     }
                 }
                 return out;
@@ -1253,6 +1220,37 @@ async def _do_google_search(
                     # Empty SERP from a non-blocked attempt → no point
                     # rotating TLDs, the query genuinely has no hits.
                     break
+
+            # Recovery: if a *plain* search (no time/page refine) got
+            # /sorry/-blocked on every TLD, the persistent cookie jar is likely
+            # flagged. Wipe it and retry once from a clean profile — a fresh
+            # Chrome profile clears the flag far more often than rotating
+            # domains on the same poisoned cookies. We skip this when a refine
+            # was requested: there the block comes from the cold /search?tbs=…
+            # navigation, not the cookies, so wiping only discards a good
+            # profile and DuckDuckGo (which honours those filters) is the right
+            # fallback instead.
+            refine_requested = bool(time_range) or page > 1
+            if not results and blocked and not refine_requested:
+                try:
+                    await ctx_persistent.close()
+                except Exception:
+                    pass
+                ctx_persistent = None
+                try:
+                    shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+                    _save_last_good_tld("com")
+                except Exception:
+                    pass
+                try:
+                    _, ctx_persistent = await _launch_stealth_browser(pw)
+                    results, blocked = await _scrape_google_serp(
+                        ctx_persistent, query, num_results,
+                        site=site, time_range=time_range, language=language,
+                        region=region, page_num=page, warmup=True, tld="com",
+                    )
+                except Exception:
+                    results, blocked = [], blocked
 
         # Fallback: DuckDuckGo only if Google was actually unreachable.
         engine = "Google"
